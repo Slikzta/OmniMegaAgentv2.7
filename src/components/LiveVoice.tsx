@@ -248,16 +248,22 @@ export default function LiveVoice() {
   const currentTranscriptRef = useRef<string>('');
   const lastCommittedTextRef = useRef<string>('');
   const silenceTimerRef = useRef<any>(null);
+  const pendingCommitTimerRef = useRef<any>(null);
   const cooldownTimerRef = useRef<any>(null);
   const retryTimerRef = useRef<any>(null);
   const recognitionTimeoutRef = useRef<any>(null);
   const consecutiveFailuresRef = useRef<number>(0);
+  const committedSessionRef = useRef<number>(-1);
+  const terminalHandledSessionRef = useRef<number>(-1);
+  const utteranceCommitTimeRef = useRef<number>(0);
+  const turnSentTimeRef = useRef<number>(0);
+  const firstAudioReceivedTimeRef = useRef<number>(0);
   const lastCommitTimeRef = useRef<number>(0);
   const lastEndOfSpeechTimeRef = useRef<number>(0);
   const lastStopTimeRef = useRef<number>(0);
   const MAX_RECOGNITION_RETRIES = 3;
   const RECOGNITION_TIMEOUT_MS = 12000;
-  const PLAYBACK_COOLDOWN_MS = 800;
+  const PLAYBACK_COOLDOWN_MS = 1200;
 
   // Keep refs synchronized with state
   useEffect(() => {
@@ -324,6 +330,10 @@ export default function LiveVoice() {
   };
 
   const cancelAllTimers = () => {
+    if (pendingCommitTimerRef.current) {
+      clearTimeout(pendingCommitTimerRef.current);
+      pendingCommitTimerRef.current = null;
+    }
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
@@ -582,11 +592,18 @@ export default function LiveVoice() {
 
   const commitCurrentUtterance = async (cycleId?: number) => {
     const currentId = cycleId ?? currentCycleIdRef.current;
+    if (committedSessionRef.current === currentId && currentId > 0) {
+      return;
+    }
     if (cycleHandledRef.current === currentId && currentId > 0) {
       return;
     }
     cycleHandledRef.current = currentId;
 
+    if (pendingCommitTimerRef.current) {
+      clearTimeout(pendingCommitTimerRef.current);
+      pendingCommitTimerRef.current = null;
+    }
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
@@ -603,22 +620,29 @@ export default function LiveVoice() {
     addDebugLog('commitCurrentUtterance', `[Cycle #${currentId}] captured: "${textToCommit}" (isSpeaking=${isSpeakingRef.current}, isResponding=${isRespondingRef.current})`);
 
     if (!textToCommit) {
+      addDebugLog('STT:UtteranceDropped', `[Cycle #${currentId}] Utterance dropped: buffer was empty`);
       console.log(`[Native STT:Commit:Cycle#${currentId}] Buffer empty, no speech to commit.`);
       handleSilenceOrEmpty(currentId);
       return;
     }
 
     if (isSpeakingRef.current || isRespondingRef.current || activeSourcesRef.current.length > 0) {
+      addDebugLog('STT:UtteranceIgnored', `[Cycle #${currentId}] Utterance ignored: Sierra audio is currently playing or queued`);
       console.log(`[Native STT:Commit:Cycle#${currentId}] Ignored: Sierra audio is currently playing or queued.`);
       return;
     }
 
     if (textToCommit === lastCommittedTextRef.current) {
+      addDebugLog('STT:UtteranceIgnored', `[Cycle #${currentId}] Utterance ignored: Duplicate of already-sent utterance "${textToCommit}"`);
       console.log(`[Native STT:Commit:Cycle#${currentId}] Ignored: Duplicate of already-sent utterance "${textToCommit}".`);
       return;
     }
-    lastCommittedTextRef.current = textToCommit;
 
+    committedSessionRef.current = currentId;
+    lastCommittedTextRef.current = textToCommit;
+    utteranceCommitTimeRef.current = Date.now();
+
+    addDebugLog('STT:UtteranceCommitted', `[Cycle #${currentId}] Utterance committed: "${textToCommit}"`);
     console.log(`[Native STT:FinalResult:Cycle#${currentId}] Complete user utterance captured:`, textToCommit);
     console.log(`[Native STT:Handoff:Cycle#${currentId}] Dispatching utterance to handleUserUtterance...`);
     lastCommitTimeRef.current = Date.now();
@@ -831,7 +855,7 @@ export default function LiveVoice() {
               outputAudioTranscription: {},
               systemInstruction: {
                 parts: [{
-                  text: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Speak warmly, directly, and concisely (1-2 short natural sentences). Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud.`
+                  text: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Talk like a real person: usually short and conversational, longer only when the question needs it. React first then answer. Vary your reactions naturally and never reuse the same one twice in a row. No scripted openers or stock phrases, no repeating the question back, and match the user's energy. Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud.`
                 }],
               },
             },
@@ -913,7 +937,14 @@ export default function LiveVoice() {
                     }
                   }
                   if (part?.inlineData?.data) {
-                    liveWsAudioReceivedRef.current = true;
+                    if (!liveWsAudioReceivedRef.current) {
+                      liveWsAudioReceivedRef.current = true;
+                      firstAudioReceivedTimeRef.current = Date.now();
+                      const latencyFromSend = turnSentTimeRef.current > 0 ? (firstAudioReceivedTimeRef.current - turnSentTimeRef.current) : 0;
+                      const latencyFromCommit = utteranceCommitTimeRef.current > 0 ? (firstAudioReceivedTimeRef.current - utteranceCommitTimeRef.current) : 0;
+                      addDebugLog('LiveWS:FirstAudio', `First audio chunk received (latency: ${latencyFromSend}ms from send, ${latencyFromCommit}ms from commit)`);
+                      console.log(`[LiveWS:FirstAudio] Latency: ${latencyFromSend}ms from send, ${latencyFromCommit}ms from commit`);
+                    }
                     // Play gaplessly via Web Audio AudioContext + AudioBufferSource scheduling
                     playAudio(part.inlineData.data);
                   }
@@ -923,10 +954,12 @@ export default function LiveVoice() {
               // Turn complete
               if (parsed.serverContent.turnComplete) {
                 liveWsTurnCompleteRef.current = true;
+                const turnCompleteTime = Date.now();
+                const totalDuration = turnSentTimeRef.current > 0 ? (turnCompleteTime - turnSentTimeRef.current) : 0;
                 const hadAudio = liveWsAudioReceivedRef.current;
                 const textReply = liveWsTextAccumulatedRef.current.trim();
-                addDebugLog('LiveWS:TurnComplete', `Turn complete (audio: ${hadAudio}, text chars: ${textReply.length})`);
-                console.log("[LiveWS] Turn complete");
+                addDebugLog('LiveWS:TurnComplete', `Turn complete (audio: ${hadAudio}, text chars: ${textReply.length}, duration: ${totalDuration}ms from send)`);
+                console.log(`[LiveWS:TurnComplete] Turn complete in ${totalDuration}ms from send`);
                 isRespondingRef.current = false;
 
                 if (textReply) {
@@ -1023,6 +1056,9 @@ export default function LiveVoice() {
     addDebugLog('handleUserUtterance', `captured: "${userText}" (isResponding=${isRespondingRef.current})`);
     console.log("[Voice:Handoff] handleUserUtterance triggered with text:", userText);
     if (!userText.trim() || isRespondingRef.current) {
+      if (isRespondingRef.current) {
+        addDebugLog('LiveWS:TurnDropped', `Turn dropped: already responding to previous utterance`);
+      }
       addDebugLog('handleUserUtterance', `Ignored: empty or already responding`);
       console.log("[Voice:Handoff] Utterance discarded: empty or isRespondingRef is true");
       return;
@@ -1058,9 +1094,6 @@ export default function LiveVoice() {
 
     // Live WebSocket branch: Reuses one WebSocket session across utterances with responseModalities: ["AUDIO"]
     if (isGeminiLiveModel(effectiveModel)) {
-      addDebugLog('LiveWS:SendTurn', `Sending user utterance to reused WebSocket session: "${userText}"`);
-      console.log("[LiveWS] Sending user turn over reused WebSocket session:", userText);
-
       liveWsCurrentSierraIdRef.current = sierraId;
       liveWsTextAccumulatedRef.current = '';
       liveWsAudioReceivedRef.current = false;
@@ -1068,6 +1101,11 @@ export default function LiveVoice() {
 
       try {
         const ws = await ensureLiveWebSocket(effectiveModel);
+        turnSentTimeRef.current = Date.now();
+        const latencyFromCommit = utteranceCommitTimeRef.current > 0 ? (turnSentTimeRef.current - utteranceCommitTimeRef.current) : 0;
+        addDebugLog('LiveWS:TurnSent', `Sending user utterance to WebSocket: "${userText}" (latency from commit: ${latencyFromCommit}ms)`);
+        console.log(`[LiveWS:TurnSent] Sent user turn at ${turnSentTimeRef.current} (${latencyFromCommit}ms from commit):`, userText);
+
         const clientContentMessage = {
           clientContent: {
             turns: [
@@ -1115,7 +1153,7 @@ export default function LiveVoice() {
           ...history,
           { role: 'user', content: userText }
         ],
-        systemInstruction: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Speak warmly, directly, and concisely (1-2 short natural sentences). Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud through Text-to-Speech.`,
+        systemInstruction: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Talk like a real person: usually short and conversational, longer only when the question needs it. React first then answer. Vary your reactions naturally and never reuse the same one twice in a row. No scripted openers or stock phrases, no repeating the question back, and match the user's energy. Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud through Text-to-Speech.`,
       }, {
         onChunk: (chunk: string) => {
           accumulatedText += chunk;
@@ -1270,6 +1308,8 @@ export default function LiveVoice() {
     currentTranscriptRef.current = '';
 
     cancelAllTimers();
+    committedSessionRef.current = -1;
+    terminalHandledSessionRef.current = -1;
 
     if (sessionRef.current) {
       try {
@@ -1352,10 +1392,10 @@ export default function LiveVoice() {
 
   const setupNativeListeners = async () => {
     // Confirm listeners are registered once (no duplicate listeners from re-renders or repeated start calls)
-    if (nativeListenersAttachedRef.current) {
+    if (nativeListenersAttachedRef.current || isSettingUpListenersRef.current) {
       return;
     }
-    nativeListenersAttachedRef.current = true;
+    isSettingUpListenersRef.current = true;
 
     addDebugLog('STT:Listeners', 'Setting up native partialResults and listeningState listeners...');
     console.log("[Native STT:Listeners] Setting up native partialResults and listeningState listeners...");
@@ -1376,13 +1416,18 @@ export default function LiveVoice() {
           }
 
           const currentSession = sessionIdRef.current;
-          addDebugLog('partialResults', `[Session #${currentSession}] matches: ${JSON.stringify(data?.matches)}`);
-          console.log(`[Native STT:partialResults:Session#${currentSession}] Matches:`, data?.matches);
+          // Late partials for an already-committed session are ignored silently, not logged as 'Sierra speaking'
+          if (committedSessionRef.current === currentSession) {
+            return;
+          }
 
           if (isSpeakingRef.current || isRespondingRef.current) {
             addDebugLog('partialResults', `[Session #${currentSession}] Ignored: Sierra currently speaking/responding`);
             return;
           }
+
+          addDebugLog('partialResults', `[Session #${currentSession}] matches: ${JSON.stringify(data?.matches)}`);
+          console.log(`[Native STT:partialResults:Session#${currentSession}] Matches:`, data?.matches);
 
           if (data?.matches && Array.isArray(data.matches) && data.matches.length > 0) {
             const topMatch = data.matches[0].trim();
@@ -1394,6 +1439,16 @@ export default function LiveVoice() {
               startupFailuresRef.current = 0;
               addDebugLog('partialResults:Buffer', `[Session #${currentSession}] Buffer updated: "${topMatch}"`);
               console.log(`[Native STT:Buffer:Session#${currentSession}] "${topMatch}"`);
+
+              // If a stopped event was waiting in the 400ms window, use this final match immediately!
+              if (pendingCommitTimerRef.current) {
+                clearTimeout(pendingCommitTimerRef.current);
+                pendingCommitTimerRef.current = null;
+                addDebugLog('STT:FinalMatchArrived', `[Session #${currentSession}] Final match arrived in 400ms window: "${topMatch}". Committing immediately.`);
+                emptyCycleCountRef.current = 0;
+                commitCurrentUtterance(currentSession);
+                return;
+              }
 
               if (silenceTimerRef.current) {
                 clearTimeout(silenceTimerRef.current);
@@ -1466,6 +1521,13 @@ export default function LiveVoice() {
             isStartingRef.current = false;
             isStartInFlightRef.current = false;
 
+            // Process only the first terminal (stopped) event per session ID
+            if (terminalHandledSessionRef.current === currentSession) {
+              console.log(`[Native STT:listeningState:Session#${currentSession}] Duplicate stopped event ignored`);
+              return;
+            }
+            terminalHandledSessionRef.current = currentSession;
+
             if (data?.matches && Array.isArray(data.matches) && data.matches.length > 0 && data.matches[0].trim()) {
               currentTranscriptRef.current = data.matches[0].trim();
               consecutiveFailuresRef.current = 0;
@@ -1477,10 +1539,20 @@ export default function LiveVoice() {
             const errorCode = data?.errorCode;
             const isClientError = errorCode === 5 || (typeof data?.error === 'string' && data.error.toLowerCase().includes('client'));
             const isCode7Or11 = errorCode === 7 || errorCode === 11 || (typeof data?.error === 'string' && (data.error.toLowerCase().includes('no match') || data.error.toLowerCase().includes("didn't understand")));
+            const now = Date.now();
+            const elapsedFromStart = sessionRealStartTimeRef.current > 0 ? (now - sessionRealStartTimeRef.current) : 0;
 
             if (data?.error) {
               addDebugLog('STT:NativeError', `[Session #${currentSession}] Native recognizer reported: "${data.error}" (code: ${errorCode})`);
               console.warn(`[Native STT:NativeError:Session#${currentSession}]`, data.error, errorCode);
+            }
+
+            // Instant failure after playback: if session ends with code 11 in under 150ms, log STT:InstantFail, do not count toward emptyCycleCountRef, and retry after 1000ms
+            if (errorCode === 11 && elapsedFromStart < 150 && !currentTranscriptRef.current.trim()) {
+              addDebugLog('STT:InstantFail', `[Session #${currentSession}] Session ended with code 11 in ${elapsedFromStart}ms (<150ms). Retrying in 1000ms...`);
+              console.warn(`[Native STT:InstantFail:Session#${currentSession}] Code 11 at ${elapsedFromStart}ms, retrying in 1000ms`);
+              scheduleListeningRestart(1000);
+              return;
             }
 
             // Resume tap grace period: ignore errorCode 5, 7, and 11 for 1.5s after teardown
@@ -1491,7 +1563,6 @@ export default function LiveVoice() {
               return;
             }
 
-            const now = Date.now();
             const isRecentCommit = (now - lastCommitTimeRef.current) < 3500;
             const isRecentEndOfSpeech = (now - lastEndOfSpeechTimeRef.current) < 3500;
             const isRecentStop = (now - lastStopTimeRef.current) < 3500;
@@ -1504,16 +1575,25 @@ export default function LiveVoice() {
               return;
             }
 
-            // Point 5 & Condition 2: If partial results arrived and session ends with code 7 or 11, rescue partial transcript!
-            if (isCode7Or11 && currentTranscriptRef.current.trim()) {
-              const rescuedText = currentTranscriptRef.current.trim();
-              addDebugLog('STT:PartialRescue', `[Session #${currentSession}] Rescuing partial transcript on code ${errorCode}: "${rescuedText}"`);
-              console.log(`[Native STT:PartialRescue:Session#${currentSession}] Rescuing partial transcript on code ${errorCode}: "${rescuedText}"`);
-              emptyCycleCountRef.current = 0;
-              startupFailuresRef.current = 0;
-              consecutiveFailuresRef.current = 0;
-              clientErrorRecoveryCountRef.current = 0;
-              commitCurrentUtterance(currentSession);
+            // Truncated endings: when listeningState reports "stopped" with a non-empty buffer,
+            // wait ~400ms for a final partialResults/result event. If one arrives, use its top match;
+            // otherwise commit the buffer. Commit exactly once per session.
+            if (currentTranscriptRef.current.trim()) {
+              const bufferedText = currentTranscriptRef.current.trim();
+              addDebugLog('STT:StoppedWithBuffer', `[Session #${currentSession}] Stopped with buffer: "${bufferedText}". Waiting 400ms for final partialResults...`);
+              if (pendingCommitTimerRef.current) {
+                clearTimeout(pendingCommitTimerRef.current);
+              }
+              pendingCommitTimerRef.current = setTimeout(() => {
+                pendingCommitTimerRef.current = null;
+                if (!isActiveRef.current || isPausedRef.current) return;
+                addDebugLog('STT:BufferCommitTimeout', `[Session #${currentSession}] 400ms window elapsed, committing buffered utterance: "${bufferedText}"`);
+                emptyCycleCountRef.current = 0;
+                startupFailuresRef.current = 0;
+                consecutiveFailuresRef.current = 0;
+                clientErrorRecoveryCountRef.current = 0;
+                commitCurrentUtterance(currentSession);
+              }, 400);
               return;
             }
 
@@ -1548,7 +1628,6 @@ export default function LiveVoice() {
 
               emptyCycleCountRef.current++;
               const backoffDelay = emptyCycleCountRef.current <= 1 ? 800 : 1200;
-              const elapsedFromStart = sessionRealStartTimeRef.current > 0 ? (now - sessionRealStartTimeRef.current) : 0;
               addDebugLog('STT:EmptyCycle', `[Session #${currentSession}] Empty session (code: ${errorCode}, cycle #${emptyCycleCountRef.current}, elapsed: ${elapsedFromStart}ms). Restarting in ${backoffDelay}ms...`);
               console.log(`[Native STT:Session#${currentSession}] Empty session (code: ${errorCode}), restart in ${backoffDelay}ms`);
               scheduleListeningRestart(backoffDelay);
@@ -1560,15 +1639,7 @@ export default function LiveVoice() {
               return;
             }
 
-            if (currentTranscriptRef.current.trim()) {
-              startupFailuresRef.current = 0;
-              consecutiveFailuresRef.current = 0;
-              emptyCycleCountRef.current = 0;
-              clientErrorRecoveryCountRef.current = 0;
-              commitCurrentUtterance(currentSession);
-            } else {
-              handleSilenceOrEmpty(currentSession);
-            }
+            handleSilenceOrEmpty(currentSession);
           }
         }),
         2000,
@@ -1583,6 +1654,8 @@ export default function LiveVoice() {
       nativeListenersAttachedRef.current = false;
       addDebugLog('STT:Listeners:Error', `Listener registration error: ${err?.message || String(err)}`);
       console.error("[Native STT:Listeners:Error] Registration error:", err);
+    } finally {
+      isSettingUpListenersRef.current = false;
     }
   };
 
@@ -1954,6 +2027,10 @@ export default function LiveVoice() {
   const stopSpeechToText = async () => {
     lastStopTimeRef.current = Date.now();
     console.log("[Native STT:Stop] stopSpeechToText called");
+    if (pendingCommitTimerRef.current) {
+      clearTimeout(pendingCommitTimerRef.current);
+      pendingCommitTimerRef.current = null;
+    }
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
