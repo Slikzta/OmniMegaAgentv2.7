@@ -223,6 +223,7 @@ export default function LiveVoice() {
   const currentCycleIdRef = useRef<number>(0);
   const cycleHandledRef = useRef<number>(0);
   const isStartingRef = useRef<boolean>(false);
+  const isStartInFlightRef = useRef<boolean>(false);
   const isStoppingRef = useRef<boolean>(false);
   const isListeningRef = useRef<boolean>(false);
   const isNativeListeningRef = useRef<boolean>(false);
@@ -234,14 +235,18 @@ export default function LiveVoice() {
   const clientErrorRecoveryCountRef = useRef<number>(0);
   const isRecoveringFromClientErrorRef = useRef<boolean>(false);
   const startupFailuresRef = useRef<number>(0);
+  const emptyCycleCountRef = useRef<number>(0);
+  const sessionRealStartTimeRef = useRef<number>(0);
   const sessionStartedTimeRef = useRef<number>(0);
   const sessionReadyTimeRef = useRef<number>(0);
   const hasReachedStartedRef = useRef<boolean>(false);
   const resumeGracePeriodUntilRef = useRef<number>(0);
   const recoveryStartedResolverRef = useRef<((value: boolean) => void) | null>(null);
+  const startedConfirmationTimerRef = useRef<any>(null);
   const staleEventLoggedSessionRef = useRef<number>(-1);
   const transcriptsRef = useRef<TranscriptItem[]>([]);
   const currentTranscriptRef = useRef<string>('');
+  const lastCommittedTextRef = useRef<string>('');
   const silenceTimerRef = useRef<any>(null);
   const cooldownTimerRef = useRef<any>(null);
   const retryTimerRef = useRef<any>(null);
@@ -252,7 +257,7 @@ export default function LiveVoice() {
   const lastStopTimeRef = useRef<number>(0);
   const MAX_RECOGNITION_RETRIES = 3;
   const RECOGNITION_TIMEOUT_MS = 12000;
-  const PLAYBACK_COOLDOWN_MS = 750;
+  const PLAYBACK_COOLDOWN_MS = 800;
 
   // Keep refs synchronized with state
   useEffect(() => {
@@ -335,6 +340,14 @@ export default function LiveVoice() {
       clearTimeout(recognitionTimeoutRef.current);
       recognitionTimeoutRef.current = null;
     }
+    if (startedConfirmationTimerRef.current) {
+      clearTimeout(startedConfirmationTimerRef.current);
+      startedConfirmationTimerRef.current = null;
+    }
+    if (recoveryStartedResolverRef.current) {
+      recoveryStartedResolverRef.current(false);
+      recoveryStartedResolverRef.current = null;
+    }
   };
 
   const pauseListening = (reason: string) => {
@@ -343,6 +356,7 @@ export default function LiveVoice() {
     isListeningRef.current = false;
     isNativeListeningRef.current = false;
     isStartingRef.current = false;
+    isStartInFlightRef.current = false;
     isRecoveringFromClientErrorRef.current = false;
     cancelAllTimers();
     if (Capacitor.isNativePlatform()) {
@@ -366,6 +380,11 @@ export default function LiveVoice() {
     if (!isActiveRef.current || isPausedRef.current || mode !== 'continuous') {
       return;
     }
+    if (isSpeakingRef.current || activeSourcesRef.current.length > 0) {
+      addDebugLog('STT:WaitingForAudio', 'Restart deferred: audio playback is active or queued');
+      console.log("[Native STT] scheduleListeningRestart deferred because audio is playing or queued");
+      return;
+    }
     const safeDelay = Math.max(delayMs, 300);
     if (cooldownTimerRef.current) {
       clearTimeout(cooldownTimerRef.current);
@@ -373,7 +392,10 @@ export default function LiveVoice() {
     }
     cooldownTimerRef.current = setTimeout(async () => {
       cooldownTimerRef.current = null;
-      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || mode !== 'continuous') {
+      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || mode !== 'continuous' || activeSourcesRef.current.length > 0) {
+        if (isSpeakingRef.current || activeSourcesRef.current.length > 0) {
+          addDebugLog('STT:WaitingForAudio', 'Restart deferred: audio playback is active or queued');
+        }
         return;
       }
       // After any stop or teardown, await CapSpeechRecognition.stop() with a timeout, then wait at least 800 ms before calling start() again.
@@ -386,7 +408,10 @@ export default function LiveVoice() {
         lastStopTimeRef.current = Date.now();
         await new Promise((resolve) => setTimeout(resolve, 800));
       }
-      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || isStoppingRef.current || mode !== 'continuous') {
+      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || isStoppingRef.current || mode !== 'continuous' || activeSourcesRef.current.length > 0) {
+        if (isSpeakingRef.current || activeSourcesRef.current.length > 0) {
+          addDebugLog('STT:WaitingForAudio', 'Restart deferred: audio playback is active or queued');
+        }
         return;
       }
       startSpeechToText();
@@ -409,19 +434,25 @@ export default function LiveVoice() {
       // 4. Reset native listening ref and state before restarting (do NOT set isPausedRef.current = false)
       isNativeListeningRef.current = false;
       isStartingRef.current = false;
+      isStartInFlightRef.current = false;
       setUserSpeechDetected(false);
 
       // 5. Add debug log line each time listening auto-restarts
       addDebugLog('STT:AutoRestart', 'Model turn complete and audio playback finished. Auto-restarting continuous listening...');
-      console.log('[LiveVoice] Model turn complete and audio playback finished. Scheduling listening restart with 500ms delay.');
+      console.log('[LiveVoice] Model turn complete and audio playback finished. Scheduling listening restart with 800ms cooldown.');
 
-      // 6. Schedule listening restart with a short delay of 500ms
-      scheduleListeningRestart(500);
+      // 6. Schedule listening restart with 800ms cooldown delay
+      scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
     }
   };
 
   const playTextToSpeech = async (text: string) => {
     if (!text.trim()) return;
+
+    if (cooldownTimerRef.current) {
+      clearTimeout(cooldownTimerRef.current);
+      cooldownTimerRef.current = null;
+    }
 
     // Properly stop and fully release native speech recognition plugin before TTS playback begins
     await withNativeTimeout(stopSpeechToText(), 2000, undefined, 'stopSpeechToText()');
@@ -577,16 +608,23 @@ export default function LiveVoice() {
       return;
     }
 
-    if (isSpeakingRef.current || isRespondingRef.current) {
-      console.log(`[Native STT:Commit:Cycle#${currentId}] Ignored: Sierra is currently speaking or generating response.`);
+    if (isSpeakingRef.current || isRespondingRef.current || activeSourcesRef.current.length > 0) {
+      console.log(`[Native STT:Commit:Cycle#${currentId}] Ignored: Sierra audio is currently playing or queued.`);
       return;
     }
+
+    if (textToCommit === lastCommittedTextRef.current) {
+      console.log(`[Native STT:Commit:Cycle#${currentId}] Ignored: Duplicate of already-sent utterance "${textToCommit}".`);
+      return;
+    }
+    lastCommittedTextRef.current = textToCommit;
 
     console.log(`[Native STT:FinalResult:Cycle#${currentId}] Complete user utterance captured:`, textToCommit);
     console.log(`[Native STT:Handoff:Cycle#${currentId}] Dispatching utterance to handleUserUtterance...`);
     lastCommitTimeRef.current = Date.now();
     consecutiveFailuresRef.current = 0;
     clientErrorRecoveryCountRef.current = 0;
+    emptyCycleCountRef.current = 0;
     startupFailuresRef.current = 0;
     isPausedRef.current = false;
     setIsPaused(false);
@@ -624,12 +662,12 @@ export default function LiveVoice() {
       addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Teardown complete`);
       console.log("[Native STT:ClientRecovery] Teardown complete");
 
-      // 2. Waiting 750ms
-      addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Waiting 750ms before restarting...`);
-      console.log("[Native STT:ClientRecovery] Waiting 750ms before restarting...");
-      await new Promise((resolve) => setTimeout(resolve, 750));
+      // 2. Waiting 1000ms
+      addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Waiting 1000ms before restarting...`);
+      console.log("[Native STT:ClientRecovery] Waiting 1000ms before restarting...");
+      await new Promise((resolve) => setTimeout(resolve, 1000));
 
-      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || mode !== 'continuous') {
+      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || mode !== 'continuous' || activeSourcesRef.current.length > 0) {
         isRecoveringFromClientErrorRef.current = false;
         return;
       }
@@ -639,21 +677,38 @@ export default function LiveVoice() {
       const startedPromise = new Promise<boolean>((resolve) => {
         recoveryStartedResolverRef.current = resolve;
       });
+
+      if (startedConfirmationTimerRef.current) {
+        clearTimeout(startedConfirmationTimerRef.current);
+        startedConfirmationTimerRef.current = null;
+      }
+      const timeoutPromise = new Promise<boolean>((resolve) => {
+        startedConfirmationTimerRef.current = setTimeout(() => {
+          startedConfirmationTimerRef.current = null;
+          resolve(false);
+        }, 4000);
+      });
+
       startSpeechToText();
 
-      // 4. Confirmation of "started" event (or 2 second timeout)
-      const confirmed = await withNativeTimeout(startedPromise, 2000, false, 'recovery started confirmation');
+      // 4. Confirmation of "started" event (or 4s timeout)
+      const confirmed = await Promise.race([startedPromise, timeoutPromise]);
+      if (startedConfirmationTimerRef.current) {
+        clearTimeout(startedConfirmationTimerRef.current);
+        startedConfirmationTimerRef.current = null;
+      }
       recoveryStartedResolverRef.current = null;
 
       if (confirmed) {
         addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Started confirmed for recovery attempt ${attempt}/2`);
         console.log(`[Native STT:ClientRecovery] Started confirmed for recovery attempt ${attempt}/2`);
+        clientErrorRecoveryCountRef.current = 0;
       } else {
-        addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Started confirmation timed out after 2s for recovery attempt ${attempt}/2`);
-        console.warn(`[Native STT:ClientRecovery] Started confirmation timed out after 2s for recovery attempt ${attempt}/2`);
+        addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Started confirmation timed out after 4s for recovery attempt ${attempt}/2`);
+        console.warn(`[Native STT:ClientRecovery] Started confirmation timed out after 4s for recovery attempt ${attempt}/2`);
+        clientErrorRecoveryCountRef.current = attempt;
       }
 
-      clientErrorRecoveryCountRef.current = attempt;
       isRecoveringFromClientErrorRef.current = false;
     } else {
       isRecoveringFromClientErrorRef.current = false;
@@ -664,6 +719,7 @@ export default function LiveVoice() {
         await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
       } catch (_) {}
       await teardownNativeListeners();
+      stopSession('recovery_failed');
       pauseListening("Speech recognizer unavailable, tap mic to retry");
     }
   };
@@ -1166,9 +1222,15 @@ export default function LiveVoice() {
       setIsPaused(false);
       hasLoggedPausedRef.current = false;
       consecutiveFailuresRef.current = 0;
+      emptyCycleCountRef.current = 0;
       clientErrorRecoveryCountRef.current = 0;
       addDebugLog('Session', 'Session active, starting speech-to-text');
-      startSpeechToText();
+      if (isSpeakingRef.current || activeSourcesRef.current.length > 0) {
+        addDebugLog('STT:WaitingForAudio', 'Session active, but recognizer start deferred: audio playback is active or queued');
+        console.log("[Native STT] startSession deferred recognizer start because audio is playing or queued");
+      } else {
+        startSpeechToText();
+      }
       toast.success("Sierra is listening!");
     } catch (error: any) {
       addDebugLog('Session:Error', error.message || 'Failed to start session');
@@ -1180,8 +1242,14 @@ export default function LiveVoice() {
     }
   };
 
-  const stopSession = () => {
-    addDebugLog('Session', 'Session stopped');
+  const stopSession = (reason: 'user' | 'recovery_failed' | 'error' = 'user') => {
+    if (reason === 'user') {
+      addDebugLog('Session', '[Session] Stopped by user');
+    } else if (reason === 'recovery_failed') {
+      addDebugLog('Session', '[Session] Stopped after recovery failed');
+    } else {
+      addDebugLog('Session', `[Session] Stopped: ${reason}`);
+    }
     setIsActive(false);
     isActiveRef.current = false;
     isRespondingRef.current = false;
@@ -1193,8 +1261,10 @@ export default function LiveVoice() {
     setIsPaused(false);
     hasLoggedPausedRef.current = false;
     consecutiveFailuresRef.current = 0;
+    emptyCycleCountRef.current = 0;
     clientErrorRecoveryCountRef.current = 0;
     isStartingRef.current = false;
+    isStartInFlightRef.current = false;
     isNativeListeningRef.current = false;
     liveWsTurnCompleteRef.current = false;
     currentTranscriptRef.current = '';
@@ -1357,6 +1427,12 @@ export default function LiveVoice() {
             return;
           }
 
+          // Cancel started-confirmation timer on any listeningState event (Point 7)
+          if (startedConfirmationTimerRef.current) {
+            clearTimeout(startedConfirmationTimerRef.current);
+            startedConfirmationTimerRef.current = null;
+          }
+
           const currentSession = sessionIdRef.current;
           addDebugLog('listeningState', `[Session #${currentSession}] status: "${data?.status}", payload: ${JSON.stringify(data)}, buffer: "${currentTranscriptRef.current}"`);
           console.log(`[Native STT:listeningState:Session#${currentSession}] status=${data?.status}`, data);
@@ -1365,14 +1441,19 @@ export default function LiveVoice() {
             sessionReadyTimeRef.current = Date.now();
             isNativeListeningRef.current = true;
             isStartingRef.current = false;
+            isStartInFlightRef.current = false;
           } else if (data?.status === 'started') {
             sessionStartedTimeRef.current = Date.now();
             hasReachedStartedRef.current = true;
             isNativeListeningRef.current = true;
             isStartingRef.current = false;
-            const elapsedFromReady = sessionReadyTimeRef.current > 0 ? (sessionStartedTimeRef.current - sessionReadyTimeRef.current) : 0;
-            addDebugLog('STT:Started', `[Session #${currentSession}] Recognizer started (time from ready: ${elapsedFromReady}ms)`);
-            console.log(`[Native STT:Session#${currentSession}] Recognizer started, time from ready: ${elapsedFromReady}ms`);
+            isStartInFlightRef.current = false;
+            clientErrorRecoveryCountRef.current = 0; // Point 9: reset recovery counter
+            emptyCycleCountRef.current = 0; // reset empty cycle backoff
+            const now = Date.now();
+            const elapsedFromStart = sessionRealStartTimeRef.current > 0 ? (now - sessionRealStartTimeRef.current) : 0;
+            addDebugLog('STT:Started', `[Session #${currentSession}] Recognizer started (elapsed from session start: ${elapsedFromStart}ms)`);
+            console.log(`[Native STT:Session#${currentSession}] Recognizer started (elapsed: ${elapsedFromStart}ms)`);
             if (recoveryStartedResolverRef.current) {
               recoveryStartedResolverRef.current(true);
               recoveryStartedResolverRef.current = null;
@@ -1383,25 +1464,28 @@ export default function LiveVoice() {
           } else if (data?.status === 'stopped') {
             isNativeListeningRef.current = false;
             isStartingRef.current = false;
+            isStartInFlightRef.current = false;
 
             if (data?.matches && Array.isArray(data.matches) && data.matches.length > 0 && data.matches[0].trim()) {
               currentTranscriptRef.current = data.matches[0].trim();
               consecutiveFailuresRef.current = 0;
               clientErrorRecoveryCountRef.current = 0;
+              emptyCycleCountRef.current = 0;
               startupFailuresRef.current = 0;
             }
 
             const errorCode = data?.errorCode;
             const isClientError = errorCode === 5 || (typeof data?.error === 'string' && data.error.toLowerCase().includes('client'));
+            const isCode7Or11 = errorCode === 7 || errorCode === 11 || (typeof data?.error === 'string' && (data.error.toLowerCase().includes('no match') || data.error.toLowerCase().includes("didn't understand")));
 
             if (data?.error) {
               addDebugLog('STT:NativeError', `[Session #${currentSession}] Native recognizer reported: "${data.error}" (code: ${errorCode})`);
               console.warn(`[Native STT:NativeError:Session#${currentSession}]`, data.error, errorCode);
             }
 
-            // Resume tap grace period: ignore errorCode 5 and 7 for 1.5s after teardown
+            // Resume tap grace period: ignore errorCode 5, 7, and 11 for 1.5s after teardown
             const inResumeGracePeriod = Date.now() < resumeGracePeriodUntilRef.current;
-            if (inResumeGracePeriod && (errorCode === 5 || errorCode === 7)) {
+            if (inResumeGracePeriod && (errorCode === 5 || errorCode === 7 || errorCode === 11)) {
               addDebugLog('STT:IgnoreError', `[Session #${currentSession}] Ignored benign errorCode ${errorCode} during resume grace period`);
               console.log(`[Native STT:Session#${currentSession}] Ignored benign errorCode ${errorCode} during resume grace period`);
               return;
@@ -1411,7 +1495,7 @@ export default function LiveVoice() {
             const isRecentCommit = (now - lastCommitTimeRef.current) < 3500;
             const isRecentEndOfSpeech = (now - lastEndOfSpeechTimeRef.current) < 3500;
             const isRecentStop = (now - lastStopTimeRef.current) < 3500;
-            const isSpeakingOrResponding = isSpeakingRef.current || isRespondingRef.current;
+            const isSpeakingOrResponding = isSpeakingRef.current || isRespondingRef.current || activeSourcesRef.current.length > 0;
             const isBenignClientError = isClientError && (isRecentCommit || isRecentEndOfSpeech || isRecentStop || isSpeakingOrResponding);
 
             if (isBenignClientError) {
@@ -1420,38 +1504,54 @@ export default function LiveVoice() {
               return;
             }
 
-            // Item B: Startup failure check
-            // An errorCode 7 only counts as a startup failure when timeSinceReady <= 1200ms (remove !reachedStarted)
-            const timeSinceReady = sessionReadyTimeRef.current > 0 ? (now - sessionReadyTimeRef.current) : 999999;
-            const isErrorCode7 = errorCode === 7 || (typeof data?.error === 'string' && data.error.toLowerCase().includes('no match'));
-            const isStartupFailure = isErrorCode7 && (timeSinceReady <= 1200);
+            // Point 5 & Condition 2: If partial results arrived and session ends with code 7 or 11, rescue partial transcript!
+            if (isCode7Or11 && currentTranscriptRef.current.trim()) {
+              const rescuedText = currentTranscriptRef.current.trim();
+              addDebugLog('STT:PartialRescue', `[Session #${currentSession}] Rescuing partial transcript on code ${errorCode}: "${rescuedText}"`);
+              console.log(`[Native STT:PartialRescue:Session#${currentSession}] Rescuing partial transcript on code ${errorCode}: "${rescuedText}"`);
+              emptyCycleCountRef.current = 0;
+              startupFailuresRef.current = 0;
+              consecutiveFailuresRef.current = 0;
+              clientErrorRecoveryCountRef.current = 0;
+              commitCurrentUtterance(currentSession);
+              return;
+            }
 
-            if (isStartupFailure) {
-              startupFailuresRef.current++;
-              addDebugLog('STT:StartupFailure', `[Session #${currentSession}] Startup failure (${startupFailuresRef.current}/3, errorCode: ${errorCode})`);
-              console.warn(`[Native STT:StartupFailure:Session#${currentSession}] Startup failure ${startupFailuresRef.current}/3`);
+            // Point 6: Treat errorCode 7 and 11 during recovery as benign
+            if (isRecoveringFromClientErrorRef.current && isCode7Or11) {
+              addDebugLog('STT:RecoveryBenign', `[Session #${currentSession}] Ignored benign errorCode ${errorCode} during client error recovery`);
+              console.log(`[Native STT:Session#${currentSession}] Ignored benign errorCode ${errorCode} during recovery`);
+              if (startedConfirmationTimerRef.current) {
+                clearTimeout(startedConfirmationTimerRef.current);
+                startedConfirmationTimerRef.current = null;
+              }
+              emptyCycleCountRef.current++;
+              const backoffDelay = emptyCycleCountRef.current <= 1 ? 800 : 1200;
+              scheduleListeningRestart(backoffDelay);
+              return;
+            }
 
-              if (startupFailuresRef.current >= 3) {
-                const errorMsg = "Speech recognizer failed to start after 3 attempts. Tap mic to retry.";
-                addDebugLog('STT:Error', errorMsg);
-                setConnectionError(errorMsg);
-                toast.error(errorMsg);
-                pauseListening(errorMsg);
-                try {
-                  await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
-                } catch (_) {}
-                await teardownNativeListeners();
-                return;
+            // Point 3 & Condition 3: Do not restart immediately on errorCode 7 or 11. Growing backoff 800ms, then 1200ms.
+            if (isCode7Or11) {
+              const timeSinceReady = sessionReadyTimeRef.current > 0 ? (now - sessionReadyTimeRef.current) : 999999;
+              const isStartupFailure = (errorCode === 7) && (timeSinceReady <= 1200);
+
+              if (isStartupFailure) {
+                startupFailuresRef.current++;
+                addDebugLog('STT:StartupFailure', `[Session #${currentSession}] Startup failure detected (${startupFailuresRef.current}/3, timeSinceReady: ${timeSinceReady}ms)`);
+                if (startupFailuresRef.current >= 3) {
+                  pauseListening("Speech recognizer failed to start after 3 attempts. Tap mic to retry.");
+                  toast.error("Speech recognizer failed to start after 3 attempts.");
+                  return;
+                }
               }
 
-              const backoff = startupFailuresRef.current === 1 ? 1000 : startupFailuresRef.current === 2 ? 2000 : 4000;
-              addDebugLog('STT:Retry', `[Session #${currentSession}] Scheduling startup failure retry with ${backoff}ms backoff (attempt ${startupFailuresRef.current}/3)...`);
-              try {
-                await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
-              } catch (_) {}
-              await teardownNativeListeners();
-              await setupNativeListeners();
-              scheduleListeningRestart(backoff);
+              emptyCycleCountRef.current++;
+              const backoffDelay = emptyCycleCountRef.current <= 1 ? 800 : 1200;
+              const elapsedFromStart = sessionRealStartTimeRef.current > 0 ? (now - sessionRealStartTimeRef.current) : 0;
+              addDebugLog('STT:EmptyCycle', `[Session #${currentSession}] Empty session (code: ${errorCode}, cycle #${emptyCycleCountRef.current}, elapsed: ${elapsedFromStart}ms). Restarting in ${backoffDelay}ms...`);
+              console.log(`[Native STT:Session#${currentSession}] Empty session (code: ${errorCode}), restart in ${backoffDelay}ms`);
+              scheduleListeningRestart(backoffDelay);
               return;
             }
 
@@ -1463,12 +1563,9 @@ export default function LiveVoice() {
             if (currentTranscriptRef.current.trim()) {
               startupFailuresRef.current = 0;
               consecutiveFailuresRef.current = 0;
+              emptyCycleCountRef.current = 0;
+              clientErrorRecoveryCountRef.current = 0;
               commitCurrentUtterance(currentSession);
-            } else if (isErrorCode7) {
-              // Silence timeout from normal listening (>1200ms): restart immediately without counting a failure, with no limit while Live tab is active
-              addDebugLog('STT:Silence', `[Session #${currentSession}] Normal silence timeout (code 7 after ${timeSinceReady}ms), restarting without failure count...`);
-              console.log(`[Native STT:Session#${currentSession}] Normal silence timeout (code 7), restarting listening immediately...`);
-              scheduleListeningRestart(300);
             } else {
               handleSilenceOrEmpty(currentSession);
             }
@@ -1490,8 +1587,16 @@ export default function LiveVoice() {
   };
 
   const startSpeechToText = async () => {
-    // Single isStarting / isListening / isPaused state machine held in refs. Ignore start requests while starting, listening, stopping, or paused.
+    // Audio playback check: Do not start while audio is playing or queued
+    if (isSpeakingRef.current || activeSourcesRef.current.length > 0) {
+      addDebugLog('STT:WaitingForAudio', 'Start deferred: audio playback is active or queued');
+      console.log("[Native STT] startSpeechToText deferred because audio is playing or queued");
+      return;
+    }
+
+    // In-flight guard: prevent concurrent start invocations
     if (
+      isStartInFlightRef.current ||
       !isActiveRef.current ||
       isPausedRef.current ||
       isStartingRef.current ||
@@ -1500,35 +1605,42 @@ export default function LiveVoice() {
       isSpeakingRef.current ||
       isRespondingRef.current
     ) {
-      console.log("[Native STT] startSpeechToText ignored: active=", isActiveRef.current, "paused=", isPausedRef.current, "starting=", isStartingRef.current, "stopping=", isStoppingRef.current, "listening=", isNativeListeningRef.current, "speaking=", isSpeakingRef.current, "responding=", isRespondingRef.current);
+      console.log("[Native STT] startSpeechToText ignored: inFlight=", isStartInFlightRef.current, "active=", isActiveRef.current, "paused=", isPausedRef.current, "starting=", isStartingRef.current, "stopping=", isStoppingRef.current, "listening=", isNativeListeningRef.current, "speaking=", isSpeakingRef.current, "responding=", isRespondingRef.current);
       return;
     }
 
-    // Wait at least 800 ms after any stop or teardown before calling start()
-    const elapsedSinceStop = Date.now() - lastStopTimeRef.current;
-    if (elapsedSinceStop < 800) {
-      const waitTime = 800 - elapsedSinceStop;
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
-      if (!isActiveRef.current || isPausedRef.current || isStoppingRef.current) {
-        return;
+    isStartInFlightRef.current = true;
+
+    try {
+      // Wait at least 800 ms after any stop or teardown before calling start()
+      const elapsedSinceStop = Date.now() - lastStopTimeRef.current;
+      if (elapsedSinceStop < 800) {
+        const waitTime = 800 - elapsedSinceStop;
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        if (!isActiveRef.current || isPausedRef.current || isStoppingRef.current || isSpeakingRef.current || activeSourcesRef.current.length > 0) {
+          if (isSpeakingRef.current || activeSourcesRef.current.length > 0) {
+            addDebugLog('STT:WaitingForAudio', 'Start aborted during gap wait: audio started playing');
+          }
+          return;
+        }
       }
-    }
 
-    // 1. Native Capacitor Speech Recognition on Android / iOS
-    if (Capacitor.isNativePlatform()) {
-      isStartingRef.current = true;
+      // 1. Native Capacitor Speech Recognition on Android / iOS
+      if (Capacitor.isNativePlatform()) {
+        isStartingRef.current = true;
 
-      // Monotonically increasing session ID stored in a ref
-      const sessionId = ++sessionIdRef.current;
-      currentCycleIdRef.current = sessionId;
-      currentTranscriptRef.current = '';
-      hasReachedStartedRef.current = false;
-      sessionReadyTimeRef.current = 0;
-      sessionStartedTimeRef.current = 0;
+        // Monotonically increasing session ID stored in a ref
+        const sessionId = ++sessionIdRef.current;
+        sessionRealStartTimeRef.current = Date.now();
+        currentCycleIdRef.current = sessionId;
+        currentTranscriptRef.current = '';
+        hasReachedStartedRef.current = false;
+        sessionReadyTimeRef.current = 0;
+        sessionStartedTimeRef.current = 0;
 
-      // Cancellation check helper: abort if paused, stopped, or superseded
-      const isStartCancelled = () => {
-        return !isActiveRef.current || isPausedRef.current || isStoppingRef.current || sessionIdRef.current !== sessionId;
+        // Cancellation check helper: abort if paused, stopped, or superseded
+        const isStartCancelled = () => {
+          return !isActiveRef.current || isPausedRef.current || isStoppingRef.current || sessionIdRef.current !== sessionId;
       };
 
       try {
@@ -1654,7 +1766,7 @@ export default function LiveVoice() {
         try {
           result = await CapSpeechRecognition.start({
             language: 'en-US',
-            maxResults: 1,
+            maxResults: 5,
             prompt: '',
             popup: false,
             partialResults: true,
@@ -1680,12 +1792,17 @@ export default function LiveVoice() {
           currentTranscriptRef.current = result.matches[0].trim();
           consecutiveFailuresRef.current = 0;
           clientErrorRecoveryCountRef.current = 0;
+          emptyCycleCountRef.current = 0;
           startupFailuresRef.current = 0;
         }
 
         return;
       } catch (nativeErr: any) {
         isStartingRef.current = false;
+        if (startedConfirmationTimerRef.current) {
+          clearTimeout(startedConfirmationTimerRef.current);
+          startedConfirmationTimerRef.current = null;
+        }
         if (recognitionTimeoutRef.current) {
           clearTimeout(recognitionTimeoutRef.current);
           recognitionTimeoutRef.current = null;
@@ -1708,7 +1825,7 @@ export default function LiveVoice() {
         const isRecentCommit = (now - lastCommitTimeRef.current) < 3500;
         const isRecentEndOfSpeech = (now - lastEndOfSpeechTimeRef.current) < 3500;
         const isRecentStop = (now - lastStopTimeRef.current) < 3500;
-        const isSpeakingOrResponding = isSpeakingRef.current || isRespondingRef.current;
+        const isSpeakingOrResponding = isSpeakingRef.current || isRespondingRef.current || activeSourcesRef.current.length > 0;
         const isBenignClientErr = isClientErr && (isRecentCommit || isRecentEndOfSpeech || isRecentStop || isSpeakingOrResponding);
 
         if (isBenignClientErr) {
@@ -1721,7 +1838,7 @@ export default function LiveVoice() {
           return;
         }
 
-        if (isActiveRef.current && !isPausedRef.current && !isSpeakingRef.current && !isRespondingRef.current && mode === 'continuous') {
+        if (isActiveRef.current && !isPausedRef.current && !isSpeakingRef.current && !isRespondingRef.current && mode === 'continuous' && activeSourcesRef.current.length === 0) {
           consecutiveFailuresRef.current++;
           console.log(`[Native STT:Error] Retry counter: ${consecutiveFailuresRef.current}/${MAX_RECOGNITION_RETRIES}`);
           if (consecutiveFailuresRef.current >= MAX_RECOGNITION_RETRIES) {
@@ -1759,7 +1876,7 @@ export default function LiveVoice() {
       recognition.lang = 'en-US';
 
       recognition.onresult = (event: any) => {
-        if (isSpeakingRef.current || isRespondingRef.current) return;
+        if (isSpeakingRef.current || isRespondingRef.current || activeSourcesRef.current.length > 0) return;
 
         let interimText = '';
         let finalPhrase = '';
@@ -1783,6 +1900,7 @@ export default function LiveVoice() {
           console.log("[Web STT:Result] Captured final phrase:", userText);
           setUserSpeechDetected(false);
           consecutiveFailuresRef.current = 0;
+          emptyCycleCountRef.current = 0;
           console.log("[Web STT:Handoff] Passing to handleUserUtterance:", userText);
           handleUserUtterance(userText);
         }
@@ -1798,7 +1916,7 @@ export default function LiveVoice() {
 
       recognition.onend = () => {
         console.log("[Web STT:End] Browser speech recognition ended");
-        if (isActiveRef.current && !isSpeakingRef.current && !isRespondingRef.current && mode === 'continuous') {
+        if (isActiveRef.current && !isSpeakingRef.current && !isRespondingRef.current && mode === 'continuous' && activeSourcesRef.current.length === 0) {
           scheduleListeningRestart(400);
         }
       };
@@ -1808,7 +1926,10 @@ export default function LiveVoice() {
     } catch (e) {
       console.warn("[Web STT:Error] Web Speech recognition STT init error:", e);
     }
-  };
+  } finally {
+    isStartInFlightRef.current = false;
+  }
+};
 
   const teardownNativeListeners = async () => {
     isStoppingRef.current = true;
@@ -1973,6 +2094,11 @@ export default function LiveVoice() {
 
   // CRITICAL FIX: Single persistent AudioContext and timeline queue to eliminate AudioContext leaks and freezing
   const playAudio = async (base64Data: string) => {
+    if (cooldownTimerRef.current) {
+      clearTimeout(cooldownTimerRef.current);
+      cooldownTimerRef.current = null;
+    }
+
     setIsSpeaking(true);
     isSpeakingRef.current = true;
 
