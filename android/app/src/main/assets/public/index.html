@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>OmniAgent: The Ultimate AI Companion</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    body { background-color: #09090b; color: #f4f4f5; font-family: system-ui, -apple-system, sans-serif; }
+    .neon-border { border-color: #27272a; }
+    .purple-glow { box-shadow: 0 0 20px rgba(168, 85, 247, 0.25); }
+    .pulse-orb {
+      animation: pulse 2s infinite ease-in-out;
+    }
+    @keyframes pulse {
+      0% { transform: scale(0.95); opacity: 0.8; }
+      50% { transform: scale(1.05); opacity: 1; filter: drop-shadow(0 0 35px #a855f7); }
+      100% { transform: scale(0.95); opacity: 0.8; }
+    }
+  </style>
+</head>
+<body class="flex flex-col h-screen overflow-hidden bg-zinc-950 text-zinc-100">
+  <!-- Top Bar -->
+  <header class="flex items-center justify-between px-4 py-3 bg-zinc-900/80 border-b border-zinc-800 backdrop-blur z-20">
+    <div class="flex items-center space-x-3">
+      <div class="w-8 h-8 rounded-lg bg-purple-500/20 flex items-center justify-center text-purple-400 border border-purple-500/30">
+        <i class="fa-solid fa-sparkles text-sm"></i>
+      </div>
+      <div>
+        <div class="flex items-center space-x-2">
+          <span class="font-bold text-sm tracking-wide">OmniAgent</span>
+          <span class="w-2 h-2 rounded-full bg-cyan-400"></span>
+        </div>
+        <p class="text-[10px] text-zinc-400">Native Android & Jetpack Compose</p>
+      </div>
+    </div>
+    <div class="flex items-center space-x-2">
+      <button id="persona-btn" class="px-2.5 py-1 text-xs rounded-full bg-zinc-800 border border-zinc-700 text-purple-300 font-medium flex items-center space-x-1.5 hover:bg-zinc-700">
+        <i class="fa-solid fa-brain text-[10px]"></i>
+        <span id="persona-label">Companion</span>
+      </button>
+      <button id="mode-btn" class="px-2.5 py-1 text-xs rounded-full bg-zinc-800 border border-zinc-700 text-cyan-400 font-bold hover:bg-zinc-700">
+        <span id="mode-label">SFW</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Screen Containers -->
+  <main class="flex-1 overflow-y-auto relative p-4 flex flex-col">
+    <!-- Chat Screen -->
+    <div id="tab-chat" class="flex-1 flex flex-col justify-between space-y-4">
+      <!-- Quick Starters -->
+      <div class="flex space-x-2 overflow-x-auto pb-2 scrollbar-none">
+        <button onclick="sendQuickPrompt('Explain quantum computing simply')" class="whitespace-nowrap px-3 py-1.5 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-zinc-400 hover:text-white hover:border-zinc-700">Quantum Computing</button>
+        <button onclick="sendQuickPrompt('Explain clean Android architecture')" class="whitespace-nowrap px-3 py-1.5 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-zinc-400 hover:text-white hover:border-zinc-700">Android Architecture</button>
+        <button onclick="sendQuickPrompt('Write a creative story with Sierra')" class="whitespace-nowrap px-3 py-1.5 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-zinc-400 hover:text-white hover:border-zinc-700">Creative Story</button>
+        <button onclick="sendQuickPrompt('Brainstorm AI startup concepts')" class="whitespace-nowrap px-3 py-1.5 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-zinc-400 hover:text-white hover:border-zinc-700">Startup Ideas</button>
+      </div>
+
+      <!-- Messages Area -->
+      <div id="chat-messages" class="flex-1 overflow-y-auto space-y-4 pr-1">
+        <div class="flex items-start space-x-3">
+          <div class="w-7 h-7 rounded-full bg-purple-500/20 border border-purple-500/40 flex items-center justify-center text-purple-400 text-xs">
+            <i class="fa-solid fa-sparkles"></i>
+          </div>
+          <div class="bg-zinc-900 border border-zinc-800 rounded-2xl rounded-tl-sm p-3.5 max-w-[85%] text-sm leading-relaxed text-zinc-200">
+            Hey there! I'm Sierra, your personal AI companion in OmniAgent. I'm ready to write code, explore creative ideas, or chat hands-free via Live Voice. What's on your mind today?
+          </div>
+        </div>
+      </div>
+
+      <!-- Input Bar -->
+      <div class="bg-zinc-900/90 border border-zinc-800 rounded-2xl p-2 flex items-center space-x-2">
+        <button id="grounding-btn" onclick="toggleGrounding()" title="Web Search Grounding" class="w-9 h-9 rounded-xl flex items-center justify-center text-zinc-400 hover:text-cyan-400 hover:bg-zinc-800">
+          <i class="fa-solid fa-globe text-sm"></i>
+        </button>
+        <input id="chat-input" type="text" placeholder="Message Sierra..." class="flex-1 bg-transparent border-0 outline-none text-sm text-white placeholder-zinc-500 px-2" onkeydown="if(event.key === 'Enter') handleSend()">
+        <button id="mic-btn" onclick="toggleVoiceInput()" title="Voice Input" class="w-9 h-9 rounded-xl flex items-center justify-center text-zinc-400 hover:text-purple-400 hover:bg-zinc-800">
+          <i class="fa-solid fa-microphone text-sm"></i>
+        </button>
+        <button onclick="handleSend()" class="w-9 h-9 rounded-xl bg-purple-600 hover:bg-purple-500 flex items-center justify-center text-white">
+          <i class="fa-solid fa-paper-plane text-xs"></i>
+        </button>
+      </div>
+    </div>
+
+    <!-- Live Voice Screen -->
+    <div id="tab-live" class="hidden flex-1 flex flex-col items-center justify-between py-6">
+      <div class="flex items-center justify-between w-full">
+        <div class="flex items-center space-x-2 bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-xl text-xs">
+          <span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
+          <span class="text-zinc-300 font-medium">Gemini 3.8 Live</span>
+        </div>
+        <div class="text-xs text-zinc-400">Aoede Neural Voice</div>
+      </div>
+
+      <div class="flex flex-col items-center justify-center my-auto">
+        <div id="live-orb" class="w-48 h-48 rounded-full bg-gradient-to-tr from-purple-600 via-indigo-600 to-cyan-400 flex items-center justify-center purple-glow pulse-orb shadow-2xl cursor-pointer" onclick="toggleLiveVoice()">
+          <div class="w-32 h-32 rounded-full bg-zinc-950/80 backdrop-blur flex items-center justify-center">
+            <i id="live-orb-icon" class="fa-solid fa-microphone text-3xl text-purple-400"></i>
+          </div>
+        </div>
+        <p id="live-status" class="mt-6 text-sm font-semibold text-zinc-300">Tap Orb to Begin Spoken Dialogue</p>
+        <p class="text-xs text-zinc-500 mt-1">Continuous hands-free conversation with Sierra</p>
+      </div>
+
+      <div class="w-full bg-zinc-900 border border-zinc-800 rounded-2xl p-3 h-32 overflow-y-auto text-xs text-zinc-400 space-y-1">
+        <div class="font-bold text-[10px] text-zinc-500 tracking-wider uppercase mb-1">Live Transcript</div>
+        <div id="live-transcript-feed">Dialogue utterances will stream here...</div>
+      </div>
+    </div>
+
+    <!-- Media Screen -->
+    <div id="tab-media" class="hidden flex-1 flex flex-col space-y-4">
+      <div class="flex space-x-2 border-b border-zinc-800 pb-2">
+        <button class="px-4 py-1.5 rounded-lg bg-purple-600 text-xs font-bold text-white">Imagen 3 (Images)</button>
+        <button class="px-4 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-bold text-zinc-400">Veo 3.1 (Video)</button>
+      </div>
+
+      <div class="space-y-3">
+        <label class="text-xs font-semibold text-zinc-300">Prompt</label>
+        <textarea id="media-prompt" rows="3" placeholder="A hyperrealistic neon cyberpunk portrait of Sierra in the rain..." class="w-full bg-zinc-900 border border-zinc-800 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-purple-500"></textarea>
+
+        <div class="flex space-x-2 overflow-x-auto pb-1">
+          <button onclick="setMediaStyle('Photorealistic')" class="px-3 py-1 bg-zinc-900 border border-zinc-800 rounded-lg text-xs text-zinc-300 hover:border-purple-500">Photorealistic</button>
+          <button onclick="setMediaStyle('Artistic')" class="px-3 py-1 bg-zinc-900 border border-zinc-800 rounded-lg text-xs text-zinc-300 hover:border-purple-500">Artistic</button>
+          <button onclick="setMediaStyle('Cinematic')" class="px-3 py-1 bg-zinc-900 border border-zinc-800 rounded-lg text-xs text-zinc-300 hover:border-purple-500">Cinematic</button>
+        </div>
+
+        <button onclick="generateSampleImage()" class="w-full py-3 bg-purple-600 hover:bg-purple-500 rounded-xl font-bold text-sm text-white flex items-center justify-center space-x-2">
+          <i class="fa-solid fa-wand-magic-sparkles"></i>
+          <span>Generate Asset</span>
+        </button>
+
+        <div id="media-result" class="hidden bg-zinc-900 border border-zinc-800 rounded-2xl p-3 text-center">
+          <img id="media-img" class="w-full h-48 object-cover rounded-xl border border-zinc-800" src="" alt="Generated Visual">
+          <p id="media-caption" class="text-xs text-zinc-400 mt-2"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Integrations Screen -->
+    <div id="tab-integrations" class="hidden flex-1 flex flex-col space-y-4">
+      <h2 class="text-base font-bold text-white">External Integrations</h2>
+      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 space-y-3">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center space-x-3">
+            <div class="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center"><i class="fa-solid fa-database"></i></div>
+            <div><div class="text-sm font-bold">Supabase Database</div><div class="text-xs text-zinc-400">PostgreSQL Cloud Sync</div></div>
+          </div>
+          <span class="text-xs font-bold text-emerald-400">Active</span>
+        </div>
+        <p class="text-xs text-zinc-400">Configured in OmniPreferences repository for persistent memory.</p>
+      </div>
+
+      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 space-y-3">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center space-x-3">
+            <div class="w-8 h-8 rounded-lg bg-cyan-500/20 text-cyan-400 flex items-center justify-center"><i class="fa-brands fa-github"></i></div>
+            <div><div class="text-sm font-bold">GitHub Developer Tools</div><div class="text-xs text-zinc-400">Octokit API & Repository Access</div></div>
+          </div>
+          <span class="text-xs font-bold text-cyan-400">Ready</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Screen -->
+    <div id="tab-settings" class="hidden flex-1 flex flex-col space-y-4 overflow-y-auto">
+      <h2 class="text-base font-bold text-white">Settings & Multi-Provider AI</h2>
+      
+      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 space-y-3">
+        <div class="text-xs font-bold uppercase text-purple-400 tracking-wider">Active AI Provider</div>
+        <div class="grid grid-cols-2 gap-2">
+          <button class="p-2.5 rounded-xl border border-purple-500 bg-purple-500/20 text-left">
+            <div class="text-xs font-bold text-white">Google Gemini</div>
+            <div class="text-[10px] text-zinc-400">gemini-2.5-flash</div>
+          </button>
+          <button class="p-2.5 rounded-xl border border-zinc-800 bg-zinc-950 text-left hover:border-zinc-700">
+            <div class="text-xs font-bold text-white">OpenAI GPT-4o</div>
+            <div class="text-[10px] text-zinc-400">gpt-4o-mini</div>
+          </button>
+          <button class="p-2.5 rounded-xl border border-zinc-800 bg-zinc-950 text-left hover:border-zinc-700">
+            <div class="text-xs font-bold text-white">Claude 3.7</div>
+            <div class="text-[10px] text-zinc-400">sonnet-latest</div>
+          </button>
+          <button class="p-2.5 rounded-xl border border-zinc-800 bg-zinc-950 text-left hover:border-zinc-700">
+            <div class="text-xs font-bold text-white">Ollama Local</div>
+            <div class="text-[10px] text-zinc-400">llama3.2</div>
+          </button>
+        </div>
+      </div>
+
+      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4 space-y-2">
+        <div class="text-xs font-bold uppercase text-purple-400 tracking-wider">Sierra TTS Speech Settings</div>
+        <div class="flex justify-between text-xs text-zinc-300"><span>Speech Rate</span><span>100%</span></div>
+        <input type="range" min="60" max="140" value="100" class="w-full accent-purple-500">
+        <div class="flex justify-between text-xs text-zinc-300 mt-2"><span>Speech Pitch</span><span>100%</span></div>
+        <input type="range" min="60" max="140" value="100" class="w-full accent-cyan-500">
+      </div>
+    </div>
+  </main>
+
+  <!-- Bottom Navigation -->
+  <nav class="flex items-center justify-around py-3 bg-zinc-900 border-t border-zinc-800 text-zinc-400 text-xs z-20">
+    <button onclick="switchTab('chat')" id="nav-chat" class="flex flex-col items-center space-y-1 text-purple-400 font-semibold">
+      <i class="fa-solid fa-message text-base"></i><span>Chat</span>
+    </button>
+    <button onclick="switchTab('live')" id="nav-live" class="flex flex-col items-center space-y-1 hover:text-white">
+      <i class="fa-solid fa-waveform-lines text-base"></i><span>Live Voice</span>
+    </button>
+    <button onclick="switchTab('media')" id="nav-media" class="flex flex-col items-center space-y-1 hover:text-white">
+      <i class="fa-solid fa-wand-magic-sparkles text-base"></i><span>Media</span>
+    </button>
+    <button onclick="switchTab('integrations')" id="nav-integrations" class="flex flex-col items-center space-y-1 hover:text-white">
+      <i class="fa-solid fa-network-wired text-base"></i><span>Integrations</span>
+    </button>
+    <button onclick="switchTab('settings')" id="nav-settings" class="flex flex-col items-center space-y-1 hover:text-white">
+      <i class="fa-solid fa-gear text-base"></i><span>Settings</span>
+    </button>
+  </nav>
+
+  <script>
+    let activeTab = 'chat';
+    let currentMode = 'SFW';
+    let currentPersona = 'Companion';
+    let isLiveActive = false;
+    let webSearch = false;
+
+    function switchTab(tab) {
+      ['chat', 'live', 'media', 'integrations', 'settings'].forEach(t => {
+        document.getElementById('tab-' + t).classList.add('hidden');
+        document.getElementById('nav-' + t).classList.remove('text-purple-400', 'font-semibold');
+      });
+      document.getElementById('tab-' + tab).classList.remove('hidden');
+      document.getElementById('nav-' + tab).classList.add('text-purple-400', 'font-semibold');
+      activeTab = tab;
+    }
+
+    function toggleGrounding() {
+      webSearch = !webSearch;
+      const btn = document.getElementById('grounding-btn');
+      btn.classList.toggle('text-cyan-400', webSearch);
+      btn.classList.toggle('bg-cyan-500/20', webSearch);
+    }
+
+    function toggleLiveVoice() {
+      isLiveActive = !isLiveActive;
+      const orb = document.getElementById('live-orb');
+      const icon = document.getElementById('live-orb-icon');
+      const status = document.getElementById('live-status');
+      const feed = document.getElementById('live-transcript-feed');
+
+      if (isLiveActive) {
+        orb.classList.add('ring-8', 'ring-purple-500/50');
+        icon.className = 'fa-solid fa-waveform-lines text-3xl text-cyan-400 animate-pulse';
+        status.innerText = 'Sierra is Listening... Speak now.';
+        feed.innerHTML += '<div class="text-purple-300 mt-1">Sierra: Connected via Gemini 3.8 Live. I am listening!</div>';
+      } else {
+        orb.classList.remove('ring-8', 'ring-purple-500/50');
+        icon.className = 'fa-solid fa-microphone text-3xl text-purple-400';
+        status.innerText = 'Live Voice Paused. Tap to Resume.';
+      }
+    }
+
+    function sendQuickPrompt(prompt) {
+      document.getElementById('chat-input').value = prompt;
+      handleSend();
+    }
+
+    function handleSend() {
+      const input = document.getElementById('chat-input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      const container = document.getElementById('chat-messages');
+
+      // Add user message
+      container.innerHTML += \`
+        <div class="flex items-start justify-end space-x-3">
+          <div class="bg-purple-900/60 border border-purple-500/40 rounded-2xl rounded-tr-sm p-3.5 max-w-[85%] text-sm text-white">
+            \${escapeHtml(text)}
+          </div>
+        </div>
+      \

@@ -1,0 +1,2613 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Capacitor } from '@capacitor/core';
+import { Clipboard } from '@capacitor/clipboard';
+import { SpeechRecognition as CapSpeechRecognition } from '@capacitor-community/speech-recognition';
+import { TextToSpeech } from '@capacitor-community/text-to-speech';
+import { useAuthState } from 'react-firebase-hooks/auth';
+import { auth, db } from '../lib/firebase';
+import { collection, addDoc } from 'firebase/firestore';
+import { Button } from './ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import { Input } from './ui/input';
+import { LIVE_VOICE_MODELS, DEFAULT_LIVE_WEBSOCKET_URL, isGeminiLiveModel } from '../lib/gemini';
+import { 
+  Mic, MicOff, Loader2, Sparkles, AlertCircle, RefreshCw, Volume2, MessageSquare,
+  Copy, FileText, Trash2, Check, X, AlertTriangle, ChevronDown
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { cn } from '../lib/utils';
+import { toast } from 'sonner';
+import { SIERRA_CORE_PERSONA } from '../lib/persona';
+import { streamChat, getNativeStoredKeys } from '../lib/providers';
+
+interface TranscriptItem {
+  id: string;
+  sender: 'user' | 'sierra';
+  text: string;
+  timestamp: number;
+}
+
+import { formatDebugLogs, type DebugLogEvent } from '../lib/debugLogs';
+export { formatDebugLogs, type DebugLogEvent };
+
+export default function LiveVoice() {
+  const [user] = useAuthState(auth);
+  const [isActive, setIsActive] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [mode, setMode] = useState<'continuous' | 'push'>('continuous');
+  const [isPushing, setIsPushing] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
+  const [userSpeechDetected, setUserSpeechDetected] = useState(false);
+  const [selectedVoice, setSelectedVoice] = useState<'Aoede' | 'Zephyr' | 'Kore' | 'Puck'>('Aoede');
+  const [voiceModel, setVoiceModel] = useState<string>(() => {
+    return (typeof localStorage !== 'undefined' && localStorage.getItem('sierra_live_voice_model')) || 'gemini-3.8-live';
+  });
+  const [customVoiceModel, setCustomVoiceModel] = useState<string>(() => {
+    return (typeof localStorage !== 'undefined' && localStorage.getItem('sierra_live_voice_custom_model')) || '';
+  });
+  const [liveWsEndpoint, setLiveWsEndpoint] = useState<string>(() => {
+    return (typeof localStorage !== 'undefined' && localStorage.getItem('sierra_live_voice_endpoint')) || DEFAULT_LIVE_WEBSOCKET_URL;
+  });
+  const [debugLogs, setDebugLogs] = useState<{ id: string; time: string; stage: string; detail: string }[]>([]);
+  const [isDebugLogOpen, setIsDebugLogOpen] = useState(false);
+  const [isConfigExpanded, setIsConfigExpanded] = useState(false);
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [isCopied, setIsCopied] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [isFallbackModalOpen, setIsFallbackModalOpen] = useState(false);
+  const [fallbackLogText, setFallbackLogText] = useState('');
+  const fallbackTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const debugScrollRef = useRef<HTMLDivElement>(null);
+  const logTimestampsRef = useRef<Map<string, number>>(new Map());
+
+  const addDebugLog = (stage: string, detail: string) => {
+    const now = Date.now();
+    const logKey = `${stage}:${detail}`;
+    const lastTime = logTimestampsRef.current.get(logKey);
+    // Throttle logging: don't write more than one identical log line per second
+    if (lastTime && now - lastTime < 1000) {
+      return;
+    }
+    logTimestampsRef.current.set(logKey, now);
+    if (logTimestampsRef.current.size > 200) {
+      for (const [k, t] of logTimestampsRef.current.entries()) {
+        if (now - t > 5000) logTimestampsRef.current.delete(k);
+      }
+    }
+    const time = new Date().toLocaleTimeString();
+    console.log(`[VoiceDebug] [${time}] [${stage}] ${detail}`);
+    setDebugLogs(prev => [
+      ...prev.slice(-49),
+      { id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, time, stage, detail }
+    ]);
+  };
+
+  const withNativeTimeout = async <T,>(
+    promise: Promise<T>,
+    ms: number = 2000,
+    fallbackValue?: T,
+    opName: string = 'Native operation'
+  ): Promise<T | undefined> => {
+    let timeoutId: any = null;
+    let didTimeout = false;
+    const timeoutPromise = new Promise<T | undefined>((resolve) => {
+      timeoutId = setTimeout(() => {
+        didTimeout = true;
+        console.warn(`[Native STT] ${opName} timed out after ${ms}ms, continuing`);
+        addDebugLog('STT:Timeout', `${opName} timed out after ${ms}ms`);
+        resolve(fallbackValue);
+      }, ms);
+    });
+
+    try {
+      const result = await Promise.race([
+        promise.then((res) => {
+          if (!didTimeout) {
+            console.log(`[Native STT] ${opName} completed normally`);
+          }
+          return res;
+        }),
+        timeoutPromise
+      ]);
+      return result;
+    } catch (err: any) {
+      console.warn(`[Native STT] ${opName} threw error:`, err);
+      addDebugLog('STT:Error', `${opName} error: ${err?.message || String(err)}`);
+      return fallbackValue;
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
+  };
+
+  useEffect(() => {
+    debugScrollRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [debugLogs]);
+
+  useEffect(() => {
+    if (isFallbackModalOpen && fallbackTextareaRef.current) {
+      fallbackTextareaRef.current.focus();
+      fallbackTextareaRef.current.select();
+    }
+  }, [isFallbackModalOpen]);
+
+  const copyDebugLogs = async (count?: number) => {
+    if (debugLogs.length === 0) {
+      toast.info("No debug events logged yet. Speak or tap the orb first.");
+      return;
+    }
+
+    const textToCopy = formatDebugLogs(debugLogs, count);
+    let copied = false;
+
+    // 1. Native Capacitor Clipboard
+    if (Capacitor.isNativePlatform()) {
+      try {
+        await Clipboard.write({ string: textToCopy });
+        copied = true;
+      } catch (nativeErr: any) {
+        console.warn("[Clipboard] Capacitor Clipboard.write failed, falling back:", nativeErr);
+      }
+    }
+
+    // 2. Browser Navigator Clipboard API
+    if (!copied && typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      try {
+        await navigator.clipboard.writeText(textToCopy);
+        copied = true;
+      } catch (webErr: any) {
+        console.warn("[Clipboard] navigator.clipboard.writeText failed:", webErr);
+      }
+    }
+
+    // 3. Fallback: execCommand('copy') with off-screen textarea
+    if (!copied && typeof document !== 'undefined') {
+      try {
+        const tempTextArea = document.createElement('textarea');
+        tempTextArea.value = textToCopy;
+        tempTextArea.style.position = 'fixed';
+        tempTextArea.style.left = '-9999px';
+        tempTextArea.style.top = '0';
+        tempTextArea.setAttribute('readonly', '');
+        document.body.appendChild(tempTextArea);
+        tempTextArea.focus();
+        tempTextArea.select();
+        copied = document.execCommand('copy');
+        document.body.removeChild(tempTextArea);
+      } catch (execErr: any) {
+        console.warn("[Clipboard] document.execCommand('copy') failed:", execErr);
+      }
+    }
+
+    if (copied) {
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+      toast.success("Debug log copied. Paste it into ChatGPT.");
+    } else {
+      toast.error("Could not write to clipboard automatically. Select and copy from the box below.");
+      setFallbackLogText(textToCopy);
+      setIsFallbackModalOpen(true);
+    }
+  };
+
+  const handleClearConfirm = () => {
+    setDebugLogs([]);
+    setShowClearConfirm(false);
+    toast.info("Debug log cleared.");
+  };
+
+  const sessionRef = useRef<any>(null);
+  const liveWsRef = useRef<any>(null);
+  const liveWsReadyRef = useRef<boolean>(false);
+  const liveWsConnectPromiseRef = useRef<Promise<any> | null>(null);
+  const liveWsAudioReceivedRef = useRef<boolean>(false);
+  const liveWsTextAccumulatedRef = useRef<string>('');
+  const liveWsCurrentSierraIdRef = useRef<string | null>(null);
+  const liveWsTurnCompleteRef = useRef<boolean>(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const nextPlayTimeRef = useRef<number>(0);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const speechRecognitionRef = useRef<any>(null);
+  const nativeListenerRef = useRef<any>(null);
+  const nativeStateListenerRef = useRef<any>(null);
+  const nativeListenersAttachedRef = useRef<boolean>(false);
+  const isSettingUpListenersRef = useRef<boolean>(false);
+  const sessionIdRef = useRef<number>(0);
+  const currentCycleIdRef = useRef<number>(0);
+  const cycleHandledRef = useRef<number>(0);
+  const isStartingRef = useRef<boolean>(false);
+  const isStoppingRef = useRef<boolean>(false);
+  const isListeningRef = useRef<boolean>(false);
+  const isNativeListeningRef = useRef<boolean>(false);
+  const isSpeakingRef = useRef<boolean>(false);
+  const isRespondingRef = useRef<boolean>(false);
+  const isActiveRef = useRef<boolean>(false);
+  const isPausedRef = useRef<boolean>(false);
+  const hasLoggedPausedRef = useRef<boolean>(false);
+  const clientErrorRecoveryCountRef = useRef<number>(0);
+  const isRecoveringFromClientErrorRef = useRef<boolean>(false);
+  const startupFailuresRef = useRef<number>(0);
+  const sessionStartedTimeRef = useRef<number>(0);
+  const sessionReadyTimeRef = useRef<number>(0);
+  const hasReachedStartedRef = useRef<boolean>(false);
+  const resumeGracePeriodUntilRef = useRef<number>(0);
+  const recoveryStartedResolverRef = useRef<((value: boolean) => void) | null>(null);
+  const staleEventLoggedSessionRef = useRef<number>(-1);
+  const transcriptsRef = useRef<TranscriptItem[]>([]);
+  const currentTranscriptRef = useRef<string>('');
+  const silenceTimerRef = useRef<any>(null);
+  const cooldownTimerRef = useRef<any>(null);
+  const retryTimerRef = useRef<any>(null);
+  const recognitionTimeoutRef = useRef<any>(null);
+  const consecutiveFailuresRef = useRef<number>(0);
+  const lastCommitTimeRef = useRef<number>(0);
+  const lastEndOfSpeechTimeRef = useRef<number>(0);
+  const lastStopTimeRef = useRef<number>(0);
+  const MAX_RECOGNITION_RETRIES = 3;
+  const RECOGNITION_TIMEOUT_MS = 12000;
+  const PLAYBACK_COOLDOWN_MS = 750;
+
+  // Keep refs synchronized with state
+  useEffect(() => {
+    isSpeakingRef.current = isSpeaking;
+  }, [isSpeaking]);
+
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
+
+  useEffect(() => {
+    transcriptsRef.current = transcripts;
+  }, [transcripts]);
+
+  // Auto-scroll transcript container
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [transcripts]);
+
+  // Clean up Web Audio and media stream on unmount
+  useEffect(() => {
+    return () => {
+      isNativeListeningRef.current = false;
+      stopSession();
+    };
+  }, []);
+
+  // Sync voice model and live endpoint to localStorage
+  useEffect(() => {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('sierra_live_voice_model', voiceModel);
+      if (customVoiceModel.trim()) {
+        localStorage.setItem('sierra_live_voice_custom_model', customVoiceModel.trim());
+      } else {
+        localStorage.removeItem('sierra_live_voice_custom_model');
+      }
+      localStorage.setItem('sierra_live_voice_endpoint', liveWsEndpoint.trim() || DEFAULT_LIVE_WEBSOCKET_URL);
+    }
+  }, [voiceModel, customVoiceModel, liveWsEndpoint]);
+
+  const persistVoiceMessage = async (sender: 'user' | 'sierra', text: string) => {
+    if (!text.trim() || !user) return;
+    const effectiveModel = customVoiceModel.trim() || voiceModel || 'gemini-3.8-live';
+    try {
+      await addDoc(collection(db, `users/${user.uid}/sessions/live-voice-session/messages`), {
+        role: sender === 'user' ? 'user' : 'model',
+        content: text,
+        timestamp: Date.now(),
+        isVoice: true,
+        modelName: `Sierra Live (${effectiveModel})`,
+      });
+    } catch (err) {
+      console.warn("Could not save live voice transcript to Firestore:", err);
+    }
+  };
+
+  const getBackoffDelay = (attempt: number): number => {
+    // Exponential backoff for consecutive failures (500 ms, 1 s, 2 s, 4 s)
+    if (attempt <= 1) return 500;
+    if (attempt === 2) return 1000;
+    if (attempt === 3) return 2000;
+    return 4000;
+  };
+
+  const cancelAllTimers = () => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (cooldownTimerRef.current) {
+      clearTimeout(cooldownTimerRef.current);
+      cooldownTimerRef.current = null;
+    }
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    if (recognitionTimeoutRef.current) {
+      clearTimeout(recognitionTimeoutRef.current);
+      recognitionTimeoutRef.current = null;
+    }
+  };
+
+  const pauseListening = (reason: string) => {
+    isPausedRef.current = true;
+    setIsPaused(true);
+    isListeningRef.current = false;
+    isNativeListeningRef.current = false;
+    isStartingRef.current = false;
+    isRecoveringFromClientErrorRef.current = false;
+    cancelAllTimers();
+    if (Capacitor.isNativePlatform()) {
+      isStoppingRef.current = true;
+      withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()')
+        .catch(() => {})
+        .finally(() => {
+          isStoppingRef.current = false;
+          lastStopTimeRef.current = Date.now();
+        });
+    }
+    if (!hasLoggedPausedRef.current) {
+      hasLoggedPausedRef.current = true;
+      addDebugLog('STT:Paused', reason);
+      console.log("[STT:Paused]", reason);
+    }
+  };
+
+  const scheduleListeningRestart = (delayMs: number = PLAYBACK_COOLDOWN_MS) => {
+    // The paused state must be checked before restarting. Once paused, nothing may call start again until the user taps the mic.
+    if (!isActiveRef.current || isPausedRef.current || mode !== 'continuous') {
+      return;
+    }
+    const safeDelay = Math.max(delayMs, 300);
+    if (cooldownTimerRef.current) {
+      clearTimeout(cooldownTimerRef.current);
+      cooldownTimerRef.current = null;
+    }
+    cooldownTimerRef.current = setTimeout(async () => {
+      cooldownTimerRef.current = null;
+      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || mode !== 'continuous') {
+        return;
+      }
+      // After any stop or teardown, await CapSpeechRecognition.stop() with a timeout, then wait at least 800 ms before calling start() again.
+      if (Capacitor.isNativePlatform()) {
+        isStoppingRef.current = true;
+        try {
+          await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
+        } catch (_) {}
+        isStoppingRef.current = false;
+        lastStopTimeRef.current = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || isStoppingRef.current || mode !== 'continuous') {
+        return;
+      }
+      startSpeechToText();
+    }, safeDelay);
+  };
+
+  const checkAndRestartListeningAfterTurn = () => {
+    // 1. Must be active, continuous mode, and NOT paused (respects errorCode 5 and manual pause)
+    if (!isActiveRef.current || isPausedRef.current || mode !== 'continuous') {
+      return;
+    }
+    // 2. Only proceed if model turn is complete, not generating response, not currently speaking, and no active audio sources playing
+    if (liveWsTurnCompleteRef.current && !isRespondingRef.current && !isSpeakingRef.current && activeSourcesRef.current.length === 0) {
+      // 3. Ensure only one restart is ever pending: clear any existing restart cooldown timer
+      if (cooldownTimerRef.current) {
+        clearTimeout(cooldownTimerRef.current);
+        cooldownTimerRef.current = null;
+      }
+
+      // 4. Reset native listening ref and state before restarting (do NOT set isPausedRef.current = false)
+      isNativeListeningRef.current = false;
+      isStartingRef.current = false;
+      setUserSpeechDetected(false);
+
+      // 5. Add debug log line each time listening auto-restarts
+      addDebugLog('STT:AutoRestart', 'Model turn complete and audio playback finished. Auto-restarting continuous listening...');
+      console.log('[LiveVoice] Model turn complete and audio playback finished. Scheduling listening restart with 500ms delay.');
+
+      // 6. Schedule listening restart with a short delay of 500ms
+      scheduleListeningRestart(500);
+    }
+  };
+
+  const playTextToSpeech = async (text: string) => {
+    if (!text.trim()) return;
+
+    // Properly stop and fully release native speech recognition plugin before TTS playback begins
+    await withNativeTimeout(stopSpeechToText(), 2000, undefined, 'stopSpeechToText()');
+
+    // Clean markdown symbols for natural TTS speech
+    const cleanText = text.replace(/[*#_`~>]/g, '').trim();
+    if (!cleanText) return;
+
+    // 1. Native Capacitor Text-to-Speech on Android / iOS
+    if (Capacitor.isNativePlatform()) {
+      setIsSpeaking(true);
+      isSpeakingRef.current = true;
+      addDebugLog('TTS:Start', `Starting native TextToSpeech.speak() (${cleanText.length} chars)`);
+      console.log("[Native TTS:Start] Starting speak:", cleanText);
+
+      let didTimeout = false;
+      let timer: any = null;
+      const timeoutPromise = new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => {
+          didTimeout = true;
+          addDebugLog('TTS:Timeout', 'Native TextToSpeech.speak() timed out after 15000ms');
+          console.warn("[Native TTS:Timeout] speak() timed out after 15000ms");
+          resolve('timeout');
+        }, 15000);
+      });
+
+      try {
+        const result = await Promise.race([
+          TextToSpeech.speak({
+            text: cleanText,
+            lang: 'en-US',
+            rate: 1.0,
+          }).then(() => 'finished' as const),
+          timeoutPromise
+        ]);
+
+        if (result === 'finished' && !didTimeout) {
+          addDebugLog('TTS:Finished', 'Native TextToSpeech.speak() completed successfully');
+          console.log("[Native TTS:Finished] speak() completed successfully");
+        }
+      } catch (err: any) {
+        addDebugLog('TTS:Error', `Native TextToSpeech error: ${err?.message || String(err)}`);
+        console.error("[Native TTS:Error] Native TextToSpeech speak error:", err);
+      } finally {
+        if (timer) clearTimeout(timer);
+        setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        if (isActiveRef.current && mode === 'continuous') {
+          isPausedRef.current = false;
+          setIsPaused(false);
+        }
+        scheduleListeningRestart();
+      }
+      return;
+    }
+
+    // 2. Web browser fallback with SpeechSynthesis
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      if (isActiveRef.current && mode === 'continuous') {
+        isPausedRef.current = false;
+        setIsPaused(false);
+        scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+      }
+      return;
+    }
+
+    try {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.rate = 1.05;
+      utterance.pitch = 1.0;
+      utterance.lang = 'en-US';
+
+      // Pick natural voice if available
+      const voices = window.speechSynthesis.getVoices();
+      if (voices && voices.length > 0) {
+        const preferred = voices.find(v => 
+          v.lang.startsWith('en') && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Female'))
+        ) || voices.find(v => v.lang.startsWith('en'));
+        if (preferred) {
+          utterance.voice = preferred;
+        }
+      }
+
+      utterance.onstart = () => {
+        setIsSpeaking(true);
+        isSpeakingRef.current = true;
+        addDebugLog('TTS:Start', `Web SpeechSynthesis started (${cleanText.length} chars)`);
+      };
+
+      utterance.onend = () => {
+        setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        addDebugLog('TTS:Finished', 'Web SpeechSynthesis completed');
+        // Resume continuous listening ONLY after playback fully completes, with a short cooldown buffer
+        // to avoid catching playback tail audio from the device speaker
+        if (isActiveRef.current && mode === 'continuous') {
+          isPausedRef.current = false;
+          setIsPaused(false);
+          scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+        }
+      };
+
+      utterance.onerror = (e) => {
+        console.warn("TTS playback error:", e);
+        addDebugLog('TTS:Error', `Web SpeechSynthesis error: ${e.error || 'unknown'}`);
+        setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        if (isActiveRef.current && mode === 'continuous') {
+          isPausedRef.current = false;
+          setIsPaused(false);
+          scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+        }
+      };
+
+      window.speechSynthesis.speak(utterance);
+    } catch (ttsErr: any) {
+      console.warn("TTS execution error:", ttsErr);
+      addDebugLog('TTS:Error', `Web SpeechSynthesis exception: ${ttsErr?.message || String(ttsErr)}`);
+      setIsSpeaking(false);
+      isSpeakingRef.current = false;
+      if (isActiveRef.current && mode === 'continuous') {
+        scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+      }
+    }
+  };
+
+  const commitCurrentUtterance = async (cycleId?: number) => {
+    const currentId = cycleId ?? currentCycleIdRef.current;
+    if (cycleHandledRef.current === currentId && currentId > 0) {
+      return;
+    }
+    cycleHandledRef.current = currentId;
+
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (recognitionTimeoutRef.current) {
+      clearTimeout(recognitionTimeoutRef.current);
+      recognitionTimeoutRef.current = null;
+    }
+
+    const textToCommit = currentTranscriptRef.current.trim();
+    currentTranscriptRef.current = '';
+    setUserSpeechDetected(false);
+
+    addDebugLog('commitCurrentUtterance', `[Cycle #${currentId}] captured: "${textToCommit}" (isSpeaking=${isSpeakingRef.current}, isResponding=${isRespondingRef.current})`);
+
+    if (!textToCommit) {
+      console.log(`[Native STT:Commit:Cycle#${currentId}] Buffer empty, no speech to commit.`);
+      handleSilenceOrEmpty(currentId);
+      return;
+    }
+
+    if (isSpeakingRef.current || isRespondingRef.current) {
+      console.log(`[Native STT:Commit:Cycle#${currentId}] Ignored: Sierra is currently speaking or generating response.`);
+      return;
+    }
+
+    console.log(`[Native STT:FinalResult:Cycle#${currentId}] Complete user utterance captured:`, textToCommit);
+    console.log(`[Native STT:Handoff:Cycle#${currentId}] Dispatching utterance to handleUserUtterance...`);
+    lastCommitTimeRef.current = Date.now();
+    consecutiveFailuresRef.current = 0;
+    clientErrorRecoveryCountRef.current = 0;
+    startupFailuresRef.current = 0;
+    isPausedRef.current = false;
+    setIsPaused(false);
+    await stopSpeechToText();
+    await handleUserUtterance(textToCommit);
+  };
+
+  const handleClientErrorRecovery = async (targetSessionId: number) => {
+    if (!isActiveRef.current || isPausedRef.current) return;
+    if (isRecoveringFromClientErrorRef.current) {
+      console.log("[Native STT:ClientRecovery] Recovery already in progress, ignoring duplicate call");
+      return;
+    }
+
+    isRecoveringFromClientErrorRef.current = true;
+    isStartingRef.current = false;
+    isListeningRef.current = false;
+    isNativeListeningRef.current = false;
+    cancelAllTimers();
+
+    // Each recovery attempt awaits teardown, 750ms wait, start, confirmation of started event (or 2s timeout) before counting
+    if (clientErrorRecoveryCountRef.current < 2) {
+      const attempt = clientErrorRecoveryCountRef.current + 1;
+      addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Recovering from client error (attempt ${attempt}/2)...`);
+      console.warn(`[Native STT:ClientRecovery:Session#${targetSessionId}] Recovering from client error (${attempt}/2)...`);
+
+      // 1. Await teardown
+      isStoppingRef.current = true;
+      try {
+        await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
+      } catch (_) {}
+      await teardownNativeListeners();
+      isStoppingRef.current = false;
+      lastStopTimeRef.current = Date.now();
+      addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Teardown complete`);
+      console.log("[Native STT:ClientRecovery] Teardown complete");
+
+      // 2. Waiting 750ms
+      addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Waiting 750ms before restarting...`);
+      console.log("[Native STT:ClientRecovery] Waiting 750ms before restarting...");
+      await new Promise((resolve) => setTimeout(resolve, 750));
+
+      if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current || mode !== 'continuous') {
+        isRecoveringFromClientErrorRef.current = false;
+        return;
+      }
+
+      // 3. Start recognizer
+      await setupNativeListeners();
+      const startedPromise = new Promise<boolean>((resolve) => {
+        recoveryStartedResolverRef.current = resolve;
+      });
+      startSpeechToText();
+
+      // 4. Confirmation of "started" event (or 2 second timeout)
+      const confirmed = await withNativeTimeout(startedPromise, 2000, false, 'recovery started confirmation');
+      recoveryStartedResolverRef.current = null;
+
+      if (confirmed) {
+        addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Started confirmed for recovery attempt ${attempt}/2`);
+        console.log(`[Native STT:ClientRecovery] Started confirmed for recovery attempt ${attempt}/2`);
+      } else {
+        addDebugLog('STT:ClientRecovery', `[Session #${targetSessionId}] Started confirmation timed out after 2s for recovery attempt ${attempt}/2`);
+        console.warn(`[Native STT:ClientRecovery] Started confirmation timed out after 2s for recovery attempt ${attempt}/2`);
+      }
+
+      clientErrorRecoveryCountRef.current = attempt;
+      isRecoveringFromClientErrorRef.current = false;
+    } else {
+      isRecoveringFromClientErrorRef.current = false;
+      addDebugLog('STT:Error', `Speech recognizer unavailable after 2 recovery attempts`);
+      setConnectionError("Speech recognizer unavailable, tap mic to retry");
+      toast.error("Speech recognizer unavailable, tap mic to retry");
+      try {
+        await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
+      } catch (_) {}
+      await teardownNativeListeners();
+      pauseListening("Speech recognizer unavailable, tap mic to retry");
+    }
+  };
+
+  const handleSilenceOrEmpty = (targetSessionId?: number) => {
+    if (!isActiveRef.current || isPausedRef.current) {
+      return;
+    }
+    const currentId = targetSessionId ?? sessionIdRef.current;
+    if (cycleHandledRef.current === currentId && currentId > 0) {
+      return;
+    }
+    cycleHandledRef.current = currentId;
+
+    isListeningRef.current = false;
+    isNativeListeningRef.current = false;
+    isStartingRef.current = false;
+    setUserSpeechDetected(false);
+
+    if (isSpeakingRef.current || isRespondingRef.current || mode !== 'continuous') {
+      return;
+    }
+
+    const reachedStarted = hasReachedStartedRef.current;
+    const sessionDuration = reachedStarted && sessionStartedTimeRef.current > 0
+      ? Date.now() - sessionStartedTimeRef.current
+      : 0;
+
+    // Only count a cycle toward the "3 empty cycles" pause if it reached "started" and ran at least 3 seconds without speech
+    if (reachedStarted && sessionDuration >= 3000) {
+      consecutiveFailuresRef.current++;
+      addDebugLog('STT:SilenceOrEmpty', `[Session #${currentId}] Round completed without speech after ${Math.round(sessionDuration / 1000)}s (failures: ${consecutiveFailuresRef.current}/${MAX_RECOGNITION_RETRIES})`);
+      console.log(`[Native STT:Session#${currentId}] Consecutive silence/empty count: ${consecutiveFailuresRef.current}/${MAX_RECOGNITION_RETRIES}`);
+
+      if (consecutiveFailuresRef.current >= MAX_RECOGNITION_RETRIES) {
+        console.warn(`[Native STT:Session#${currentId}] Continuous listening paused after maximum inactivity.`);
+        pauseListening(`Continuous listening paused after ${MAX_RECOGNITION_RETRIES} empty cycles. Tap mic to resume.`);
+        toast.info("Listening paused. Tap microphone to resume.");
+        return;
+      }
+      const backoff = getBackoffDelay(consecutiveFailuresRef.current);
+      addDebugLog('STT:Retry', `[Session #${currentId}] Scheduling listening retry with ${backoff}ms backoff (attempt ${consecutiveFailuresRef.current}/${MAX_RECOGNITION_RETRIES})`);
+      scheduleListeningRestart(backoff);
+    } else {
+      addDebugLog('STT:SilenceOrEmpty', `[Session #${currentId}] Cycle did not run >= 3s with started status (${sessionDuration}ms), not counting as empty cycle`);
+      scheduleListeningRestart(500);
+    }
+  };
+
+  const ensureLiveWebSocket = async (model: string): Promise<any> => {
+    // Reuse single open WebSocket connection across utterances
+    if (liveWsRef.current && (liveWsRef.current.readyState === 1 || liveWsRef.current.readyState === (WebSocket as any)?.OPEN)) {
+      if (liveWsReadyRef.current) {
+        return liveWsRef.current;
+      }
+      if (liveWsConnectPromiseRef.current) {
+        return await liveWsConnectPromiseRef.current;
+      }
+    }
+
+    if (liveWsConnectPromiseRef.current) {
+      return await liveWsConnectPromiseRef.current;
+    }
+
+    const connectPromise = new Promise<any>((resolve, reject) => {
+      try {
+        const keys = getNativeStoredKeys();
+        const apiKey = keys.gemini || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '') || '';
+        if (!apiKey) {
+          throw new Error("Gemini API key is required for Live Voice. Please configure your key in Settings.");
+        }
+
+        const baseEndpoint = (liveWsEndpoint && liveWsEndpoint.trim())
+          ? liveWsEndpoint.trim()
+          : (typeof localStorage !== 'undefined' ? localStorage.getItem('sierra_live_voice_endpoint') || DEFAULT_LIVE_WEBSOCKET_URL : DEFAULT_LIVE_WEBSOCKET_URL);
+
+        let wsUrl = baseEndpoint;
+        if (!wsUrl.includes('key=')) {
+          const sep = wsUrl.includes('?') ? '&' : '?';
+          wsUrl = `${wsUrl}${sep}key=${encodeURIComponent(apiKey)}`;
+        }
+
+        const targetModel = model || 'gemini-3.8-live';
+        const formattedModel = targetModel.startsWith('models/') ? targetModel : `models/${targetModel}`;
+
+        const WebSocketClass = typeof WebSocket !== 'undefined' ? WebSocket : (globalThis as any).WebSocket;
+        if (!WebSocketClass) {
+          throw new Error("WebSocket API is not supported in this environment");
+        }
+
+        addDebugLog('LiveWS:Connect', `Connecting to Gemini Live WebSocket: ${baseEndpoint} (model: ${formattedModel})`);
+        console.log(`[LiveWS:Connect] Connecting to ${baseEndpoint} with model ${formattedModel}`);
+
+        const ws = new WebSocketClass(wsUrl);
+        liveWsRef.current = ws;
+        liveWsReadyRef.current = false;
+
+        let setupResolved = false;
+
+        ws.onopen = () => {
+          addDebugLog('LiveWS:Open', 'WebSocket connection established. Sending setup with responseModalities: ["AUDIO"]');
+          console.log("[LiveWS:Open] WebSocket connected, sending setup with responseModalities: ['AUDIO']");
+          const setupMessage = {
+            setup: {
+              model: formattedModel,
+              generationConfig: {
+                responseModalities: ["AUDIO"],
+              },
+              outputAudioTranscription: {},
+              systemInstruction: {
+                parts: [{
+                  text: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Speak warmly, directly, and concisely (1-2 short natural sentences). Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud.`
+                }],
+              },
+            },
+          };
+          try {
+            ws.send(JSON.stringify(setupMessage));
+          } catch (sendErr: any) {
+            console.error("[LiveWS:Setup] Failed to send setup:", sendErr);
+            if (!setupResolved) {
+              setupResolved = true;
+              liveWsConnectPromiseRef.current = null;
+              reject(sendErr);
+            }
+          }
+        };
+
+        ws.onmessage = async (event: any) => {
+          let dataStr = '';
+          try {
+            if (typeof event.data === 'string') {
+              dataStr = event.data;
+            } else if (event.data instanceof Blob) {
+              dataStr = await event.data.text();
+            } else if (event.data instanceof ArrayBuffer) {
+              dataStr = new TextDecoder().decode(event.data);
+            } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(event.data)) {
+              dataStr = event.data.toString('utf-8');
+            } else if (event.data && typeof event.data.toString === 'function') {
+              dataStr = event.data.toString();
+            }
+
+            const parsed = JSON.parse(dataStr);
+
+            if (parsed.setupComplete !== undefined) {
+              addDebugLog('LiveWS:SetupComplete', `Gemini Live session ready for turns (${formattedModel})`);
+              console.log("[LiveWS] setupComplete received");
+              liveWsReadyRef.current = true;
+              if (!setupResolved) {
+                setupResolved = true;
+                liveWsConnectPromiseRef.current = null;
+                resolve(ws);
+              }
+              return;
+            }
+
+            if (parsed.serverContent) {
+              // Interruption
+              if (parsed.serverContent.interrupted) {
+                addDebugLog('LiveWS:Interrupted', 'Sierra audio was interrupted by user');
+                console.log("[LiveWS] Interrupted by user");
+                stopPlayback();
+                return;
+              }
+
+              // Output Audio Transcription (text display in chat)
+              if (parsed.serverContent.outputTranscription?.text) {
+                liveWsTextAccumulatedRef.current += parsed.serverContent.outputTranscription.text;
+                const currentSierraId = liveWsCurrentSierraIdRef.current;
+                if (currentSierraId) {
+                  setTranscripts(prev => prev.map(item => item.id === currentSierraId ? {
+                    ...item,
+                    text: liveWsTextAccumulatedRef.current
+                  } : item));
+                }
+              }
+
+              // Model Turn Parts (text and PCM16 24kHz audio)
+              const parts = parsed.serverContent.modelTurn?.parts;
+              if (Array.isArray(parts)) {
+                for (const part of parts) {
+                  if (part?.text) {
+                    liveWsTextAccumulatedRef.current += part.text;
+                    const currentSierraId = liveWsCurrentSierraIdRef.current;
+                    if (currentSierraId) {
+                      setTranscripts(prev => prev.map(item => item.id === currentSierraId ? {
+                        ...item,
+                        text: liveWsTextAccumulatedRef.current
+                      } : item));
+                    }
+                  }
+                  if (part?.inlineData?.data) {
+                    liveWsAudioReceivedRef.current = true;
+                    // Play gaplessly via Web Audio AudioContext + AudioBufferSource scheduling
+                    playAudio(part.inlineData.data);
+                  }
+                }
+              }
+
+              // Turn complete
+              if (parsed.serverContent.turnComplete) {
+                liveWsTurnCompleteRef.current = true;
+                const hadAudio = liveWsAudioReceivedRef.current;
+                const textReply = liveWsTextAccumulatedRef.current.trim();
+                addDebugLog('LiveWS:TurnComplete', `Turn complete (audio: ${hadAudio}, text chars: ${textReply.length})`);
+                console.log("[LiveWS] Turn complete");
+                isRespondingRef.current = false;
+
+                if (textReply) {
+                  persistVoiceMessage('sierra', textReply);
+                }
+
+                if (!hadAudio && textReply) {
+                  // Fallback to native TTS only when no audio came back
+                  addDebugLog('LiveWS:FallbackTTS', 'No audio stream returned; playing native TTS fallback');
+                  console.log("[LiveWS] Triggering native TTS fallback for response text");
+                  playTextToSpeech(textReply);
+                } else {
+                  // Restart (whether audio was received or not), as long as no audio sources are playing
+                  checkAndRestartListeningAfterTurn();
+                }
+              }
+              return;
+            }
+
+            if (parsed.error) {
+              const errMsg = parsed.error.message || JSON.stringify(parsed.error);
+              addDebugLog('LiveWS:Error', `Live server error: ${errMsg}`);
+              console.error("[LiveWS] Server error:", errMsg);
+              isRespondingRef.current = false;
+              toast.error(`Gemini Live: ${errMsg}`);
+              setConnectionError(`Gemini Live: ${errMsg}`);
+            }
+          } catch (parseErr: any) {
+            console.warn("[LiveWS] Message parse exception:", parseErr);
+          }
+        };
+
+        ws.onerror = (err: any) => {
+          const errMsg = err?.message || 'WebSocket network error';
+          addDebugLog('LiveWS:Error', errMsg);
+          console.error("[LiveWS] WebSocket error:", err);
+          isRespondingRef.current = false;
+          if (!setupResolved) {
+            setupResolved = true;
+            liveWsConnectPromiseRef.current = null;
+            reject(new Error(errMsg));
+          }
+        };
+
+        ws.onclose = (event: any) => {
+          const code = event.code;
+          const reason = event.reason || '';
+          addDebugLog('LiveWS:Close', `WebSocket closed (code: ${code}, reason: "${reason}")`);
+          console.warn(`[LiveWS:Close] Code ${code}: ${reason}`);
+          liveWsRef.current = null;
+          liveWsReadyRef.current = false;
+          liveWsConnectPromiseRef.current = null;
+          liveWsTurnCompleteRef.current = false;
+          isRespondingRef.current = false; // Never leave isResponding stuck true
+
+          let userMsg = `Gemini Live connection closed (code ${code}${reason ? `: ${reason}` : ''})`;
+          if (code === 1007) {
+            userMsg = `Gemini Live rejected configuration (code 1007${reason ? `: ${reason}` : ''}). Live models require AUDIO response modalities.`;
+          }
+          setConnectionError(userMsg);
+          toast.error(userMsg);
+
+          const currentSierraId = liveWsCurrentSierraIdRef.current;
+          if (currentSierraId && !liveWsTextAccumulatedRef.current.trim() && !liveWsAudioReceivedRef.current) {
+            setTranscripts(prev => prev.map(item => item.id === currentSierraId ? {
+              ...item,
+              text: `[${userMsg}]`
+            } : item));
+          }
+
+          if (!setupResolved) {
+            setupResolved = true;
+            reject(new Error(userMsg));
+          }
+
+          // Resume listening if active in continuous mode so recognition is never stranded
+          if (isActiveRef.current && mode === 'continuous') {
+            isPausedRef.current = false;
+            setIsPaused(false);
+            scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+          }
+        };
+      } catch (err: any) {
+        liveWsConnectPromiseRef.current = null;
+        reject(err);
+      }
+    });
+
+    liveWsConnectPromiseRef.current = connectPromise;
+    return await connectPromise;
+  };
+
+  const handleUserUtterance = async (userText: string) => {
+    addDebugLog('handleUserUtterance', `captured: "${userText}" (isResponding=${isRespondingRef.current})`);
+    console.log("[Voice:Handoff] handleUserUtterance triggered with text:", userText);
+    if (!userText.trim() || isRespondingRef.current) {
+      addDebugLog('handleUserUtterance', `Ignored: empty or already responding`);
+      console.log("[Voice:Handoff] Utterance discarded: empty or isRespondingRef is true");
+      return;
+    }
+    isRespondingRef.current = true;
+
+    // 1. Render user speech in transcript UI
+    const userItem: TranscriptItem = {
+      id: 'user-' + Date.now(),
+      sender: 'user',
+      text: userText,
+      timestamp: Date.now(),
+    };
+    setTranscripts(prev => [...prev.slice(-20), userItem]);
+    persistVoiceMessage('user', userText);
+
+    // 2. Render Sierra placeholder in transcript UI
+    const sierraId = 'sierra-' + (Date.now() + 1);
+    setTranscripts(prev => [...prev, {
+      id: sierraId,
+      sender: 'sierra',
+      text: '',
+      timestamp: Date.now(),
+    }]);
+
+    let accumulatedText = '';
+
+    // Stop and fully release STT while model is thinking/speaking to avoid picking up speaker output
+    console.log("[Voice:handleUserUtterance] Stopping and releasing STT before sending response");
+    await stopSpeechToText();
+
+    const effectiveModel = customVoiceModel.trim() || voiceModel || 'gemini-3.8-live';
+
+    // Live WebSocket branch: Reuses one WebSocket session across utterances with responseModalities: ["AUDIO"]
+    if (isGeminiLiveModel(effectiveModel)) {
+      addDebugLog('LiveWS:SendTurn', `Sending user utterance to reused WebSocket session: "${userText}"`);
+      console.log("[LiveWS] Sending user turn over reused WebSocket session:", userText);
+
+      liveWsCurrentSierraIdRef.current = sierraId;
+      liveWsTextAccumulatedRef.current = '';
+      liveWsAudioReceivedRef.current = false;
+      liveWsTurnCompleteRef.current = false;
+
+      try {
+        const ws = await ensureLiveWebSocket(effectiveModel);
+        const clientContentMessage = {
+          clientContent: {
+            turns: [
+              {
+                role: "user",
+                parts: [{ text: userText }],
+              },
+            ],
+            turnComplete: true,
+          },
+        };
+        ws.send(JSON.stringify(clientContentMessage));
+      } catch (wsErr: any) {
+        addDebugLog('LiveWS:SendError', wsErr.message || String(wsErr));
+        console.error("[LiveWS] Failed to send turn:", wsErr);
+        isRespondingRef.current = false;
+        const errMsg = wsErr.message || "Failed to connect to Gemini Live";
+        toast.error(errMsg);
+        setConnectionError(errMsg);
+        setTranscripts(prev => prev.map(item => item.id === sierraId ? {
+          ...item,
+          text: `[Error: ${errMsg}]`
+        } : item));
+        if (isActiveRef.current && mode === 'continuous') {
+          isPausedRef.current = false;
+          setIsPaused(false);
+          scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+        }
+      }
+      return;
+    }
+
+    // Standard Non-Live branch (REST streamChat fallback)
+    try {
+      const history = transcriptsRef.current.slice(-6).map(t => ({
+        role: t.sender === 'user' ? 'user' : 'model',
+        content: t.text,
+      }));
+
+      addDebugLog('streamChat', `called with model: "${effectiveModel}", prompt: "${userText}"`);
+      console.log(`[Voice:streamChat] Initiating direct streamChat call with model ${effectiveModel}, prompt:`, userText);
+      await streamChat({
+        model: effectiveModel,
+        messages: [
+          ...history,
+          { role: 'user', content: userText }
+        ],
+        systemInstruction: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Speak warmly, directly, and concisely (1-2 short natural sentences). Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud through Text-to-Speech.`,
+      }, {
+        onChunk: (chunk: string) => {
+          accumulatedText += chunk;
+          if (accumulatedText.length === chunk.length) {
+            addDebugLog('streamChat:Chunk', `First chunk received (${chunk.length} chars)`);
+          }
+          console.log("[Voice:streamChat:Chunk] Chunk received length:", chunk.length);
+          setTranscripts(prev => prev.map(item => item.id === sierraId ? { ...item, text: accumulatedText } : item));
+        },
+        onDone: async () => {
+          addDebugLog('streamChat:Done', `Completed (${accumulatedText.length} chars)`);
+          console.log("[Voice:streamChat:Done] Stream finished successfully. Full text:", accumulatedText.trim());
+          isRespondingRef.current = false;
+          if (accumulatedText.trim()) {
+            persistVoiceMessage('sierra', accumulatedText.trim());
+            console.log("[Voice:playTextToSpeech] Triggering TTS for model response");
+            await playTextToSpeech(accumulatedText.trim());
+          } else {
+            console.log("[Voice:streamChat:Done] Response text was empty, resuming listening");
+            setTranscripts(prev => prev.map(item => item.id === sierraId ? {
+              ...item,
+              text: item.text.trim() || "[No response received]"
+            } : item));
+            if (isActiveRef.current && mode === 'continuous') {
+              isPausedRef.current = false;
+              setIsPaused(false);
+              scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+            }
+          }
+        },
+        onError: (err: Error) => {
+          addDebugLog('streamChat:Error', `${err.message}`);
+          isRespondingRef.current = false;
+          console.error("[Voice:streamChat:Error] Stream chat error occurred:", err);
+          toast.error(`Voice error: ${err.message}`);
+          const displayErr = `[Error: ${err.message}]`;
+          setTranscripts(prev => prev.map(item => item.id === sierraId ? {
+            ...item,
+            text: item.text.trim() ? `${item.text}\n\n${displayErr}` : displayErr
+          } : item));
+          if (isActiveRef.current && mode === 'continuous') {
+            isPausedRef.current = false;
+            setIsPaused(false);
+            scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+          }
+        }
+      });
+    } catch (err: any) {
+      addDebugLog('streamChat:Catch', `${err.message}`);
+      isRespondingRef.current = false;
+      console.error("[Voice:streamChat:Catch] Failed to generate voice response:", err);
+      toast.error(`Failed to generate voice response: ${err.message}`);
+      const displayErr = `[Error: ${err.message}]`;
+      setTranscripts(prev => prev.map(item => item.id === sierraId ? {
+        ...item,
+        text: item.text.trim() ? `${item.text}\n\n${displayErr}` : displayErr
+      } : item));
+      if (isActiveRef.current && mode === 'continuous') {
+        isPausedRef.current = false;
+        setIsPaused(false);
+        scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+      }
+    }
+  };
+
+  const startSession = async () => {
+    const sessionStartTime = new Date().toISOString();
+    addDebugLog('Session', `Starting voice session... [${sessionStartTime}]`);
+    console.log(`[Session] Starting voice session... [${sessionStartTime}]`);
+    setIsConnecting(true);
+    setConnectionError(null);
+
+    try {
+      if (!Capacitor.isNativePlatform()) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+              channelCount: 1,
+              sampleRate: 16000,
+            },
+          });
+          mediaStreamRef.current = stream;
+          await startAudioCapture();
+        } catch (micErr: any) {
+          if (micErr.name === 'NotAllowedError' || micErr.name === 'PermissionDeniedError') {
+            throw new Error("Microphone access denied. Please allow microphone permissions in your browser or device settings.");
+          }
+          throw new Error("Unable to access microphone: " + (micErr.message || "Device error"));
+        }
+      } else {
+        // Native Android: CapSpeechRecognition manages microphone hardware directly.
+        // Stop any active Web Audio capture so Android SpeechRecognizer has exclusive mic access.
+        stopAudioCapture();
+      }
+
+      setIsActive(true);
+      isActiveRef.current = true;
+      setIsConnecting(false);
+      setConnectionError(null);
+      isPausedRef.current = false;
+      setIsPaused(false);
+      hasLoggedPausedRef.current = false;
+      consecutiveFailuresRef.current = 0;
+      clientErrorRecoveryCountRef.current = 0;
+      addDebugLog('Session', 'Session active, starting speech-to-text');
+      startSpeechToText();
+      toast.success("Sierra is listening!");
+    } catch (error: any) {
+      addDebugLog('Session:Error', error.message || 'Failed to start session');
+      console.error("Failed to start voice session:", error);
+      setIsConnecting(false);
+      setConnectionError(error.message || "Failed to establish voice connection.");
+      toast.error(error.message || "Failed to start live voice session");
+      stopAudioCapture();
+    }
+  };
+
+  const stopSession = () => {
+    addDebugLog('Session', 'Session stopped');
+    setIsActive(false);
+    isActiveRef.current = false;
+    isRespondingRef.current = false;
+    setIsConnecting(false);
+    setIsSpeaking(false);
+    isSpeakingRef.current = false;
+    setUserSpeechDetected(false);
+    isPausedRef.current = false;
+    setIsPaused(false);
+    hasLoggedPausedRef.current = false;
+    consecutiveFailuresRef.current = 0;
+    clientErrorRecoveryCountRef.current = 0;
+    isStartingRef.current = false;
+    isNativeListeningRef.current = false;
+    liveWsTurnCompleteRef.current = false;
+    currentTranscriptRef.current = '';
+
+    cancelAllTimers();
+
+    if (sessionRef.current) {
+      try {
+        sessionRef.current.close();
+      } catch (e) {
+        // ignore
+      }
+      sessionRef.current = null;
+    }
+
+    if (liveWsRef.current) {
+      try {
+        liveWsRef.current.onopen = null;
+        liveWsRef.current.onmessage = null;
+        liveWsRef.current.onerror = null;
+        liveWsRef.current.onclose = null;
+        liveWsRef.current.close(1000, "Session stopped by user");
+      } catch (e) {
+        // ignore
+      }
+      liveWsRef.current = null;
+      liveWsReadyRef.current = false;
+      liveWsConnectPromiseRef.current = null;
+    }
+
+    stopAudioCapture();
+    stopSpeechToText();
+    teardownNativeListeners();
+    stopPlayback();
+  };
+
+  const handleMicTap = async () => {
+    if (mode !== 'continuous') return;
+    if (isActive) {
+      if (isPausedRef.current) {
+        addDebugLog('STT:Resume', 'User tapped mic to resume listening from paused state');
+        console.log("[Native STT:Resume] User tapped mic to resume from paused");
+
+        // 1. Fully tear down any existing recognizer (await stop with timeout)
+        isStoppingRef.current = true;
+        if (Capacitor.isNativePlatform()) {
+          try {
+            await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
+          } catch (_) {}
+        }
+        await teardownNativeListeners();
+        isStoppingRef.current = false;
+        lastStopTimeRef.current = Date.now();
+
+        // 2. Ignore errorCode 5 and 7 for 1.5 seconds after that teardown
+        resumeGracePeriodUntilRef.current = Date.now() + 1500;
+
+        // 3. Reset all counters and flags (consecutiveFailures, clientErrorRecoveryCount, startupFailures, isPaused)
+        consecutiveFailuresRef.current = 0;
+        clientErrorRecoveryCountRef.current = 0;
+        startupFailuresRef.current = 0;
+        isPausedRef.current = false;
+        setIsPaused(false);
+        hasLoggedPausedRef.current = false;
+        setConnectionError(null);
+
+        // 4. Wait at least 750 ms
+        await new Promise((resolve) => setTimeout(resolve, 750));
+
+        if (!isActiveRef.current || isPausedRef.current) {
+          return;
+        }
+
+        // 5. Start
+        toast.success("Sierra is listening!");
+        await setupNativeListeners();
+        startSpeechToText();
+      } else {
+        stopSession();
+      }
+    } else {
+      startSession();
+    }
+  };
+
+  const setupNativeListeners = async () => {
+    // Confirm listeners are registered once (no duplicate listeners from re-renders or repeated start calls)
+    if (nativeListenersAttachedRef.current) {
+      return;
+    }
+    nativeListenersAttachedRef.current = true;
+
+    addDebugLog('STT:Listeners', 'Setting up native partialResults and listeningState listeners...');
+    console.log("[Native STT:Listeners] Setting up native partialResults and listeningState listeners...");
+
+    try {
+      // 1. partialResults listener
+      nativeListenerRef.current = await withNativeTimeout(
+        CapSpeechRecognition.addListener('partialResults', (data: { matches: string[]; sessionId?: number }) => {
+          if (!isActiveRef.current || isPausedRef.current) return;
+          const eventSessionId = (data as any)?.sessionId;
+          if (eventSessionId !== undefined && eventSessionId !== sessionIdRef.current) {
+            if (staleEventLoggedSessionRef.current !== eventSessionId) {
+              staleEventLoggedSessionRef.current = eventSessionId;
+              addDebugLog('STT:StaleEvent', `[Session #${eventSessionId} vs current #${sessionIdRef.current}] Ignored stale partialResults event`);
+              console.warn(`[Native STT:StaleEvent] Ignored stale partialResults from session #${eventSessionId} (current is #${sessionIdRef.current})`);
+            }
+            return;
+          }
+
+          const currentSession = sessionIdRef.current;
+          addDebugLog('partialResults', `[Session #${currentSession}] matches: ${JSON.stringify(data?.matches)}`);
+          console.log(`[Native STT:partialResults:Session#${currentSession}] Matches:`, data?.matches);
+
+          if (isSpeakingRef.current || isRespondingRef.current) {
+            addDebugLog('partialResults', `[Session #${currentSession}] Ignored: Sierra currently speaking/responding`);
+            return;
+          }
+
+          if (data?.matches && Array.isArray(data.matches) && data.matches.length > 0) {
+            const topMatch = data.matches[0].trim();
+            if (topMatch) {
+              currentTranscriptRef.current = topMatch;
+              setUserSpeechDetected(true);
+              consecutiveFailuresRef.current = 0;
+              clientErrorRecoveryCountRef.current = 0;
+              startupFailuresRef.current = 0;
+              addDebugLog('partialResults:Buffer', `[Session #${currentSession}] Buffer updated: "${topMatch}"`);
+              console.log(`[Native STT:Buffer:Session#${currentSession}] "${topMatch}"`);
+
+              if (silenceTimerRef.current) {
+                clearTimeout(silenceTimerRef.current);
+              }
+              silenceTimerRef.current = setTimeout(() => {
+                addDebugLog('STT:SilenceDebounce', `[Session #${currentSession}] Silence debounce fired (1200ms), committing: "${topMatch}"`);
+                console.log(`[Native STT:SilenceDebounce:Session#${currentSession}] Committing utterance...`);
+                commitCurrentUtterance(currentSession);
+              }, 1200);
+            }
+          }
+        }),
+        2000,
+        null,
+        'CapSpeechRecognition.addListener("partialResults")'
+      );
+
+      // 2. listeningState listener
+      nativeStateListenerRef.current = await withNativeTimeout(
+        CapSpeechRecognition.addListener('listeningState', async (data: { status: 'started' | 'stopped' | 'ready' | 'endOfSpeech'; matches?: string[]; error?: string; errorCode?: number; sessionId?: number }) => {
+          if (!isActiveRef.current || isPausedRef.current) {
+            return;
+          }
+          const eventSessionId = (data as any)?.sessionId;
+          if (eventSessionId !== undefined && eventSessionId !== sessionIdRef.current) {
+            if (staleEventLoggedSessionRef.current !== eventSessionId) {
+              staleEventLoggedSessionRef.current = eventSessionId;
+              addDebugLog('STT:StaleEvent', `[Session #${eventSessionId} vs current #${sessionIdRef.current}] Ignored stale listeningState (${data?.status}) event`);
+              console.warn(`[Native STT:StaleEvent] Ignored stale listeningState (${data?.status}) from session #${eventSessionId} (current is #${sessionIdRef.current})`);
+            }
+            return;
+          }
+
+          const currentSession = sessionIdRef.current;
+          addDebugLog('listeningState', `[Session #${currentSession}] status: "${data?.status}", payload: ${JSON.stringify(data)}, buffer: "${currentTranscriptRef.current}"`);
+          console.log(`[Native STT:listeningState:Session#${currentSession}] status=${data?.status}`, data);
+
+          if (data?.status === 'ready') {
+            sessionReadyTimeRef.current = Date.now();
+            isNativeListeningRef.current = true;
+            isStartingRef.current = false;
+          } else if (data?.status === 'started') {
+            sessionStartedTimeRef.current = Date.now();
+            hasReachedStartedRef.current = true;
+            isNativeListeningRef.current = true;
+            isStartingRef.current = false;
+            const elapsedFromReady = sessionReadyTimeRef.current > 0 ? (sessionStartedTimeRef.current - sessionReadyTimeRef.current) : 0;
+            addDebugLog('STT:Started', `[Session #${currentSession}] Recognizer started (time from ready: ${elapsedFromReady}ms)`);
+            console.log(`[Native STT:Session#${currentSession}] Recognizer started, time from ready: ${elapsedFromReady}ms`);
+            if (recoveryStartedResolverRef.current) {
+              recoveryStartedResolverRef.current(true);
+              recoveryStartedResolverRef.current = null;
+            }
+          } else if (data?.status === 'endOfSpeech') {
+            lastEndOfSpeechTimeRef.current = Date.now();
+            addDebugLog('STT:EndOfSpeech', `[Session #${currentSession}] Speech pause detected, waiting for recognizer results...`);
+          } else if (data?.status === 'stopped') {
+            isNativeListeningRef.current = false;
+            isStartingRef.current = false;
+
+            if (data?.matches && Array.isArray(data.matches) && data.matches.length > 0 && data.matches[0].trim()) {
+              currentTranscriptRef.current = data.matches[0].trim();
+              consecutiveFailuresRef.current = 0;
+              clientErrorRecoveryCountRef.current = 0;
+              startupFailuresRef.current = 0;
+            }
+
+            const errorCode = data?.errorCode;
+            const isClientError = errorCode === 5 || (typeof data?.error === 'string' && data.error.toLowerCase().includes('client'));
+
+            if (data?.error) {
+              addDebugLog('STT:NativeError', `[Session #${currentSession}] Native recognizer reported: "${data.error}" (code: ${errorCode})`);
+              console.warn(`[Native STT:NativeError:Session#${currentSession}]`, data.error, errorCode);
+            }
+
+            // Resume tap grace period: ignore errorCode 5 and 7 for 1.5s after teardown
+            const inResumeGracePeriod = Date.now() < resumeGracePeriodUntilRef.current;
+            if (inResumeGracePeriod && (errorCode === 5 || errorCode === 7)) {
+              addDebugLog('STT:IgnoreError', `[Session #${currentSession}] Ignored benign errorCode ${errorCode} during resume grace period`);
+              console.log(`[Native STT:Session#${currentSession}] Ignored benign errorCode ${errorCode} during resume grace period`);
+              return;
+            }
+
+            const now = Date.now();
+            const isRecentCommit = (now - lastCommitTimeRef.current) < 3500;
+            const isRecentEndOfSpeech = (now - lastEndOfSpeechTimeRef.current) < 3500;
+            const isRecentStop = (now - lastStopTimeRef.current) < 3500;
+            const isSpeakingOrResponding = isSpeakingRef.current || isRespondingRef.current;
+            const isBenignClientError = isClientError && (isRecentCommit || isRecentEndOfSpeech || isRecentStop || isSpeakingOrResponding);
+
+            if (isBenignClientError) {
+              addDebugLog('STT:IgnoreClientError', `[Session #${currentSession}] Ignored benign errorCode 5 following utterance commit, stop, or reply playback`);
+              console.log(`[Native STT:Session#${currentSession}] Ignored benign errorCode 5 following utterance commit/stop/playback`);
+              return;
+            }
+
+            // Item B: Startup failure check
+            // An errorCode 7 only counts as a startup failure when timeSinceReady <= 1200ms (remove !reachedStarted)
+            const timeSinceReady = sessionReadyTimeRef.current > 0 ? (now - sessionReadyTimeRef.current) : 999999;
+            const isErrorCode7 = errorCode === 7 || (typeof data?.error === 'string' && data.error.toLowerCase().includes('no match'));
+            const isStartupFailure = isErrorCode7 && (timeSinceReady <= 1200);
+
+            if (isStartupFailure) {
+              startupFailuresRef.current++;
+              addDebugLog('STT:StartupFailure', `[Session #${currentSession}] Startup failure (${startupFailuresRef.current}/3, errorCode: ${errorCode})`);
+              console.warn(`[Native STT:StartupFailure:Session#${currentSession}] Startup failure ${startupFailuresRef.current}/3`);
+
+              if (startupFailuresRef.current >= 3) {
+                const errorMsg = "Speech recognizer failed to start after 3 attempts. Tap mic to retry.";
+                addDebugLog('STT:Error', errorMsg);
+                setConnectionError(errorMsg);
+                toast.error(errorMsg);
+                pauseListening(errorMsg);
+                try {
+                  await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
+                } catch (_) {}
+                await teardownNativeListeners();
+                return;
+              }
+
+              const backoff = startupFailuresRef.current === 1 ? 1000 : startupFailuresRef.current === 2 ? 2000 : 4000;
+              addDebugLog('STT:Retry', `[Session #${currentSession}] Scheduling startup failure retry with ${backoff}ms backoff (attempt ${startupFailuresRef.current}/3)...`);
+              try {
+                await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
+              } catch (_) {}
+              await teardownNativeListeners();
+              await setupNativeListeners();
+              scheduleListeningRestart(backoff);
+              return;
+            }
+
+            if (isClientError && !currentTranscriptRef.current.trim()) {
+              await handleClientErrorRecovery(currentSession);
+              return;
+            }
+
+            if (currentTranscriptRef.current.trim()) {
+              startupFailuresRef.current = 0;
+              consecutiveFailuresRef.current = 0;
+              commitCurrentUtterance(currentSession);
+            } else if (isErrorCode7) {
+              // Silence timeout from normal listening (>1200ms): restart immediately without counting a failure, with no limit while Live tab is active
+              addDebugLog('STT:Silence', `[Session #${currentSession}] Normal silence timeout (code 7 after ${timeSinceReady}ms), restarting without failure count...`);
+              console.log(`[Native STT:Session#${currentSession}] Normal silence timeout (code 7), restarting listening immediately...`);
+              scheduleListeningRestart(300);
+            } else {
+              handleSilenceOrEmpty(currentSession);
+            }
+          }
+        }),
+        2000,
+        null,
+        'CapSpeechRecognition.addListener("listeningState")'
+      );
+
+      nativeListenersAttachedRef.current = true;
+      addDebugLog('STT:Listeners', 'Native listeners active and ready');
+      console.log("[Native STT:Listeners] Native listeners active and ready");
+    } catch (err: any) {
+      nativeListenersAttachedRef.current = false;
+      addDebugLog('STT:Listeners:Error', `Listener registration error: ${err?.message || String(err)}`);
+      console.error("[Native STT:Listeners:Error] Registration error:", err);
+    }
+  };
+
+  const startSpeechToText = async () => {
+    // Single isStarting / isListening / isPaused state machine held in refs. Ignore start requests while starting, listening, stopping, or paused.
+    if (
+      !isActiveRef.current ||
+      isPausedRef.current ||
+      isStartingRef.current ||
+      isStoppingRef.current ||
+      isNativeListeningRef.current ||
+      isSpeakingRef.current ||
+      isRespondingRef.current
+    ) {
+      console.log("[Native STT] startSpeechToText ignored: active=", isActiveRef.current, "paused=", isPausedRef.current, "starting=", isStartingRef.current, "stopping=", isStoppingRef.current, "listening=", isNativeListeningRef.current, "speaking=", isSpeakingRef.current, "responding=", isRespondingRef.current);
+      return;
+    }
+
+    // Wait at least 800 ms after any stop or teardown before calling start()
+    const elapsedSinceStop = Date.now() - lastStopTimeRef.current;
+    if (elapsedSinceStop < 800) {
+      const waitTime = 800 - elapsedSinceStop;
+      await new Promise((resolve) => setTimeout(resolve, waitTime));
+      if (!isActiveRef.current || isPausedRef.current || isStoppingRef.current) {
+        return;
+      }
+    }
+
+    // 1. Native Capacitor Speech Recognition on Android / iOS
+    if (Capacitor.isNativePlatform()) {
+      isStartingRef.current = true;
+
+      // Monotonically increasing session ID stored in a ref
+      const sessionId = ++sessionIdRef.current;
+      currentCycleIdRef.current = sessionId;
+      currentTranscriptRef.current = '';
+      hasReachedStartedRef.current = false;
+      sessionReadyTimeRef.current = 0;
+      sessionStartedTimeRef.current = 0;
+
+      // Cancellation check helper: abort if paused, stopped, or superseded
+      const isStartCancelled = () => {
+        return !isActiveRef.current || isPausedRef.current || isStoppingRef.current || sessionIdRef.current !== sessionId;
+      };
+
+      try {
+        addDebugLog('STT:Start', `[Session #${sessionId}] Checking availability and permissions...`);
+        console.log(`[Native STT:Start:Session#${sessionId}] Checking speech recognition availability...`);
+
+        const available = await withNativeTimeout(
+          CapSpeechRecognition.available(),
+          2000,
+          { available: false },
+          'CapSpeechRecognition.available()'
+        );
+
+        // Checkpoint 1: after availability check
+        if (isStartCancelled()) {
+          addDebugLog('STT:Start:Aborted', `[Session #${sessionId}] Aborted after availability check (paused/stopped/superseded)`);
+          isStartingRef.current = false;
+          return;
+        }
+
+        addDebugLog('STT:Start', `available: ${available?.available}`);
+        if (!available?.available) {
+          addDebugLog('STT:Start', `[Session #${sessionId}] Native speech recognition unavailable`);
+          console.warn(`[Native STT:Start:Session#${sessionId}] Native speech recognition unavailable on device`);
+          toast.error("Device speech recognition engine not available");
+          isStartingRef.current = false;
+          pauseListening("Speech recognition engine not available on device");
+          return;
+        }
+
+        // Check and request RECORD_AUDIO permission before starting
+        const permStatus = await withNativeTimeout(
+          CapSpeechRecognition.checkPermissions(),
+          2000,
+          { speechRecognition: 'prompt' as const },
+          'CapSpeechRecognition.checkPermissions()'
+        );
+
+        // Checkpoint 2: after checkPermissions
+        if (isStartCancelled()) {
+          addDebugLog('STT:Start:Aborted', `[Session #${sessionId}] Aborted after checkPermissions (paused/stopped/superseded)`);
+          isStartingRef.current = false;
+          return;
+        }
+
+        addDebugLog('STT:Start', `permStatus: ${JSON.stringify(permStatus)}`);
+        if (permStatus?.speechRecognition !== 'granted') {
+          addDebugLog('STT:Start', `[Session #${sessionId}] Requesting speech recognition permissions...`);
+          console.log(`[Native STT:Start:Session#${sessionId}] Requesting speech recognition permissions...`);
+          const reqStatus = await withNativeTimeout(
+            CapSpeechRecognition.requestPermissions(),
+            15000,
+            { speechRecognition: 'denied' as const },
+            'CapSpeechRecognition.requestPermissions()'
+          );
+
+          // Checkpoint 3: after requestPermissions
+          if (isStartCancelled()) {
+            addDebugLog('STT:Start:Aborted', `[Session #${sessionId}] Aborted after requestPermissions (paused/stopped/superseded)`);
+            isStartingRef.current = false;
+            return;
+          }
+
+          addDebugLog('STT:Start', `reqStatus: ${JSON.stringify(reqStatus)}`);
+          if (reqStatus?.speechRecognition !== 'granted') {
+            addDebugLog('STT:Start', `[Session #${sessionId}] Microphone permission denied by user`);
+            console.warn(`[Native STT:Start:Session#${sessionId}] Microphone permission denied by user`);
+            toast.error("Microphone permission required for speech recognition");
+            isStartingRef.current = false;
+            pauseListening("Microphone permission denied by user");
+            return;
+          }
+        }
+
+        // Checkpoint 4: before setupNativeListeners
+        if (isStartCancelled()) {
+          addDebugLog('STT:Start:Aborted', `[Session #${sessionId}] Aborted before setupNativeListeners (paused/stopped/superseded)`);
+          isStartingRef.current = false;
+          return;
+        }
+
+        // Setup persistent listeners (registered once)
+        await setupNativeListeners();
+
+        // Checkpoint 5: immediately before calling CapSpeechRecognition.start
+        if (isStartCancelled()) {
+          addDebugLog('STT:Start:Aborted', `[Session #${sessionId}] Aborted immediately before CapSpeechRecognition.start (paused/stopped/superseded)`);
+          isStartingRef.current = false;
+          return;
+        }
+
+        // Recognition cycle timeout (12 seconds)
+        if (recognitionTimeoutRef.current) {
+          clearTimeout(recognitionTimeoutRef.current);
+        }
+        recognitionTimeoutRef.current = setTimeout(async () => {
+          recognitionTimeoutRef.current = null;
+          if (sessionIdRef.current !== sessionId) return;
+          addDebugLog('STT:Timeout', `[Session #${sessionId}] 12s cycle timeout reached (buffer: "${currentTranscriptRef.current}")`);
+          console.warn(`[Native STT:Timeout:Session#${sessionId}] 12s recognition cycle timeout reached`);
+          if (currentTranscriptRef.current.trim()) {
+            commitCurrentUtterance(sessionId);
+          } else {
+            if (isNativeListeningRef.current) {
+              try {
+                await withNativeTimeout(
+                  CapSpeechRecognition.stop(),
+                  1500,
+                  undefined,
+                  'CapSpeechRecognition.stop()'
+                );
+              } catch (_) {}
+            }
+            handleSilenceOrEmpty(sessionId);
+          }
+        }, RECOGNITION_TIMEOUT_MS);
+
+        const startTime = Date.now();
+        addDebugLog('STT:Start', `[Session #${sessionId}] Invoking CapSpeechRecognition.start({ sessionId: ${sessionId} })...`);
+        console.log(`[Native STT:Start:Session#${sessionId}] Invoking start...`);
+
+        let result: any = null;
+        try {
+          result = await CapSpeechRecognition.start({
+            language: 'en-US',
+            maxResults: 1,
+            prompt: '',
+            popup: false,
+            partialResults: true,
+            sessionId: sessionId,
+          } as any);
+          const elapsed = Date.now() - startTime;
+          addDebugLog('STT:Start', `[Session #${sessionId}] CapSpeechRecognition.start resolved in ${elapsed}ms with: ${JSON.stringify(result)}`);
+          console.log(`[Native STT:Start:Session#${sessionId}] Resolved in ${elapsed}ms:`, result);
+        } catch (startErr: any) {
+          const elapsed = Date.now() - startTime;
+          addDebugLog('STT:Start', `[Session #${sessionId}] CapSpeechRecognition.start rejected in ${elapsed}ms: ${startErr?.message || JSON.stringify(startErr)}`);
+          console.error(`[Native STT:Start:Session#${sessionId}] Rejected in ${elapsed}ms:`, startErr);
+          throw startErr;
+        }
+
+        isNativeListeningRef.current = true;
+        isStartingRef.current = false;
+
+        // If the platform returns matches directly in the start resolution
+        if (result?.matches && Array.isArray(result.matches) && result.matches.length > 0 && result.matches[0].trim()) {
+          addDebugLog('STT:Start', `[Session #${sessionId}] Direct matches returned on resolve: "${result.matches[0]}"`);
+          console.log(`[Native STT:Start:Session#${sessionId}] Direct matches:`, result.matches[0]);
+          currentTranscriptRef.current = result.matches[0].trim();
+          consecutiveFailuresRef.current = 0;
+          clientErrorRecoveryCountRef.current = 0;
+          startupFailuresRef.current = 0;
+        }
+
+        return;
+      } catch (nativeErr: any) {
+        isStartingRef.current = false;
+        if (recognitionTimeoutRef.current) {
+          clearTimeout(recognitionTimeoutRef.current);
+          recognitionTimeoutRef.current = null;
+        }
+        isNativeListeningRef.current = false;
+        setUserSpeechDetected(false);
+        addDebugLog('STT:Error', `Exception: ${nativeErr?.message || JSON.stringify(nativeErr)}`);
+        console.error("[Native STT:Error] CapSpeechRecognition.start caught exception:", nativeErr);
+
+        if (currentTranscriptRef.current.trim()) {
+          console.log("[Native STT:Error] Rescuing buffered transcript after error:", currentTranscriptRef.current);
+          commitCurrentUtterance(sessionId);
+          return;
+        }
+
+        const errMsg = String(nativeErr?.message || '');
+        const isClientErr = errMsg.includes('5') || errMsg.toLowerCase().includes('client');
+
+        const now = Date.now();
+        const isRecentCommit = (now - lastCommitTimeRef.current) < 3500;
+        const isRecentEndOfSpeech = (now - lastEndOfSpeechTimeRef.current) < 3500;
+        const isRecentStop = (now - lastStopTimeRef.current) < 3500;
+        const isSpeakingOrResponding = isSpeakingRef.current || isRespondingRef.current;
+        const isBenignClientErr = isClientErr && (isRecentCommit || isRecentEndOfSpeech || isRecentStop || isSpeakingOrResponding);
+
+        if (isBenignClientErr) {
+          addDebugLog('STT:IgnoreClientError', `Ignored benign client error on start following recent commit/stop/playback`);
+          return;
+        }
+
+        if (isClientErr) {
+          await handleClientErrorRecovery(sessionId);
+          return;
+        }
+
+        if (isActiveRef.current && !isPausedRef.current && !isSpeakingRef.current && !isRespondingRef.current && mode === 'continuous') {
+          consecutiveFailuresRef.current++;
+          console.log(`[Native STT:Error] Retry counter: ${consecutiveFailuresRef.current}/${MAX_RECOGNITION_RETRIES}`);
+          if (consecutiveFailuresRef.current >= MAX_RECOGNITION_RETRIES) {
+            console.warn("[Native STT:Error] Continuous recognition halted: max error retries reached.");
+            pauseListening(`Continuous listening paused after ${MAX_RECOGNITION_RETRIES} empty cycles. Tap mic to resume.`);
+            toast.error("Speech recognition paused due to repeated device errors.");
+            return;
+          }
+          const backoff = getBackoffDelay(consecutiveFailuresRef.current);
+          scheduleListeningRestart(backoff);
+        }
+        return;
+      }
+    }
+
+    // 2. Web browser fallback for development environment
+    console.log("[Web STT:Start] Initializing browser SpeechRecognition fallback");
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.warn("[Web STT:Start] Speech recognition is not supported in this environment");
+      return;
+    }
+
+    if (speechRecognitionRef.current) {
+      try {
+        speechRecognitionRef.current.abort();
+      } catch (_) {}
+      speechRecognitionRef.current = null;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (event: any) => {
+        if (isSpeakingRef.current || isRespondingRef.current) return;
+
+        let interimText = '';
+        let finalPhrase = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const text = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalPhrase += text;
+          } else {
+            interimText += text;
+          }
+        }
+
+        if (interimText.trim()) {
+          setUserSpeechDetected(true);
+        }
+
+        if (finalPhrase.trim()) {
+          const userText = finalPhrase.trim();
+          addDebugLog('WebSTT:Result', `Captured final phrase: "${userText}"`);
+          console.log("[Web STT:Result] Captured final phrase:", userText);
+          setUserSpeechDetected(false);
+          consecutiveFailuresRef.current = 0;
+          console.log("[Web STT:Handoff] Passing to handleUserUtterance:", userText);
+          handleUserUtterance(userText);
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        addDebugLog('WebSTT:Error', `error: ${event.error}`);
+        if (event.error === 'no-speech' || event.error === 'audio-capture') {
+          return;
+        }
+        console.warn("[Web STT:Error] Browser speech recognition error:", event.error);
+      };
+
+      recognition.onend = () => {
+        console.log("[Web STT:End] Browser speech recognition ended");
+        if (isActiveRef.current && !isSpeakingRef.current && !isRespondingRef.current && mode === 'continuous') {
+          scheduleListeningRestart(400);
+        }
+      };
+
+      recognition.start();
+      speechRecognitionRef.current = recognition;
+    } catch (e) {
+      console.warn("[Web STT:Error] Web Speech recognition STT init error:", e);
+    }
+  };
+
+  const teardownNativeListeners = async () => {
+    isStoppingRef.current = true;
+    if (nativeListenerRef.current) {
+      try {
+        await withNativeTimeout(nativeListenerRef.current.remove(), 1000, undefined, 'nativeListener.remove()');
+      } catch (_) {}
+      nativeListenerRef.current = null;
+    }
+    if (nativeStateListenerRef.current) {
+      try {
+        await withNativeTimeout(nativeStateListenerRef.current.remove(), 1000, undefined, 'nativeStateListener.remove()');
+      } catch (_) {}
+      nativeStateListenerRef.current = null;
+    }
+    nativeListenersAttachedRef.current = false;
+    isNativeListeningRef.current = false;
+    isStoppingRef.current = false;
+    lastStopTimeRef.current = Date.now();
+  };
+
+  const stopSpeechToText = async () => {
+    lastStopTimeRef.current = Date.now();
+    console.log("[Native STT:Stop] stopSpeechToText called");
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (cooldownTimerRef.current) {
+      clearTimeout(cooldownTimerRef.current);
+      cooldownTimerRef.current = null;
+    }
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    if (recognitionTimeoutRef.current) {
+      clearTimeout(recognitionTimeoutRef.current);
+      recognitionTimeoutRef.current = null;
+    }
+
+    if (Capacitor.isNativePlatform()) {
+      isStoppingRef.current = true;
+      isNativeListeningRef.current = false;
+      isStartingRef.current = false;
+      setUserSpeechDetected(false);
+      try {
+        await withNativeTimeout(CapSpeechRecognition.stop(), 1500, undefined, 'CapSpeechRecognition.stop()');
+      } catch (_) {}
+      isStoppingRef.current = false;
+      lastStopTimeRef.current = Date.now();
+      console.log("[Native STT:Stop] Native recognizer stopped");
+      return;
+    }
+
+    if (speechRecognitionRef.current) {
+      try {
+        speechRecognitionRef.current.abort();
+      } catch (e) {
+        // ignore
+      }
+      speechRecognitionRef.current = null;
+    }
+  };
+
+  const startAudioCapture = async () => {
+    try {
+      const stream = mediaStreamRef.current || await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 16000,
+        },
+      });
+      mediaStreamRef.current = stream;
+
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      audioContextRef.current = audioCtx;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      sourceRef.current = source;
+
+      // ScriptProcessorNode buffers 4096 mono frames at 16000Hz for Gemini Live PCM
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        // Push mode check
+        if (mode === 'push' && !isPushing) {
+          setUserSpeechDetected(false);
+          return;
+        }
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        let sum = 0;
+        const pcmData = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          const sample = Math.max(-1, Math.min(1, inputData[i]));
+          sum += Math.abs(sample);
+          pcmData[i] = sample * 0x7FFF;
+        }
+
+        const avg = sum / inputData.length;
+        setUserSpeechDetected(avg > 0.02);
+
+        // Acoustic Echo Guard: If Sierra is speaking, suppress mic unless user speaks loudly (barge-in)
+        if (isSpeakingRef.current && avg < 0.08) {
+          return;
+        }
+
+        const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+
+        if (sessionRef.current) {
+          try {
+            sessionRef.current.sendRealtimeInput({
+              audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
+            });
+          } catch (sendErr) {
+            console.warn("Failed sending audio chunk:", sendErr);
+          }
+        }
+      };
+
+      // CRITICAL FIX: Connect to an isolated zero-gain node so microphone audio
+      // NEVER plays back into the room through the speakers, avoiding any audio feedback loop!
+      const muteNode = audioCtx.createGain();
+      muteNode.gain.setValueAtTime(0, audioCtx.currentTime);
+
+      source.connect(processor);
+      processor.connect(muteNode);
+      muteNode.connect(audioCtx.destination);
+    } catch (error: any) {
+      console.error("Audio capture initialization error:", error);
+      setConnectionError("Microphone hardware error: " + (error.message || "Failed to initialize audio."));
+    }
+  };
+
+  const stopAudioCapture = () => {
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close();
+      } catch (e) {
+        // ignore
+      }
+      audioContextRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
+    }
+  };
+
+  // CRITICAL FIX: Single persistent AudioContext and timeline queue to eliminate AudioContext leaks and freezing
+  const playAudio = async (base64Data: string) => {
+    setIsSpeaking(true);
+    isSpeakingRef.current = true;
+
+    try {
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const pcmData = new Int16Array(bytes.buffer);
+      const floatData = new Float32Array(pcmData.length);
+      for (let i = 0; i < pcmData.length; i++) {
+        floatData[i] = pcmData[i] / 0x7FFF;
+      }
+
+      // Re-use single persistent playback AudioContext
+      if (!playbackContextRef.current || playbackContextRef.current.state === 'closed') {
+        playbackContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      }
+
+      const audioCtx = playbackContextRef.current;
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
+      const buffer = audioCtx.createBuffer(1, floatData.length, 24000);
+      buffer.getChannelData(0).set(floatData);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+
+      activeSourcesRef.current.push(source);
+
+      // Schedule continuously on timeline for gap-free playback
+      const startTime = Math.max(audioCtx.currentTime, nextPlayTimeRef.current);
+      source.start(startTime);
+      nextPlayTimeRef.current = startTime + buffer.duration;
+
+      source.onended = () => {
+        activeSourcesRef.current = activeSourcesRef.current.filter(s => s !== source);
+        if (activeSourcesRef.current.length === 0) {
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          checkAndRestartListeningAfterTurn();
+        }
+      };
+    } catch (playbackErr) {
+      console.error("Audio playback error:", playbackErr);
+      setIsSpeaking(false);
+      isSpeakingRef.current = false;
+      checkAndRestartListeningAfterTurn();
+    }
+  };
+
+  const stopPlayback = () => {
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (_) {}
+    }
+    activeSourcesRef.current.forEach(source => {
+      try {
+        source.stop();
+      } catch (e) {
+        // ignore
+      }
+    });
+    activeSourcesRef.current = [];
+    nextPlayTimeRef.current = 0;
+    setIsSpeaking(false);
+    isSpeakingRef.current = false;
+  };
+
+  return (
+    <div className="flex-1 flex flex-col items-center h-full max-h-full bg-zinc-950 relative overflow-hidden font-sans p-3 sm:p-6">
+      {/* Background Ambience */}
+      <div className="absolute inset-0 pointer-events-none">
+        <div className={cn(
+          "absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[550px] h-[550px] rounded-full blur-[140px] transition-all duration-1000",
+          isActive ? (isSpeaking ? "bg-purple-600/25 scale-110" : "bg-indigo-600/15 scale-100") : "bg-zinc-900/20 scale-90"
+        )} />
+      </div>
+
+      {/* PINNED HEADER AREA: mic button & session status controls never scroll away */}
+      <div className="w-full max-w-md relative z-20 shrink-0 flex flex-col items-center space-y-2 text-center">
+        {/* Top Badges & Debug Log Toggle Button (Fix 3) */}
+        <div className="w-full flex items-center justify-between gap-2 px-1">
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-zinc-900/90 border border-zinc-800 shadow-sm">
+            <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+            <span className="text-[10px] font-bold text-zinc-300 uppercase tracking-widest">Sierra Neural Voice</span>
+          </div>
+
+          {/* Toggle Button for Debug Log (Fix 3: opens on demand rather than always visible inline) */}
+          <button
+            type="button"
+            onClick={() => setIsDebugLogOpen(true)}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-zinc-900/90 hover:bg-zinc-800 active:bg-zinc-750 border border-amber-500/30 text-[10px] font-semibold text-amber-300 transition-all shadow-sm active:scale-95 touch-manipulation"
+            title="Open Diagnostic Pipeline Logs"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+            <span>Debug Log</span>
+            {debugLogs.length > 0 && (
+              <span className="px-1.5 py-0.2 rounded-full bg-amber-500/20 text-[9px] font-mono text-amber-300">
+                {debugLogs.length}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {/* Title and subtitle (compact on mobile) */}
+        <div className="hidden sm:block">
+          <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-zinc-100">Natural Voice</h1>
+          <p className="text-zinc-400 text-xs">Real-time, zero-latency natural spoken conversation.</p>
+        </div>
+
+        {/* Voice Character Select & Mode Bar */}
+        <div className="flex flex-wrap items-center justify-center gap-2 pt-0.5">
+          {/* Voice Character Select */}
+          <div className="flex items-center gap-1 bg-zinc-900/80 p-1 rounded-xl border border-zinc-800 text-xs">
+            <span className="text-[10px] font-bold text-zinc-500 uppercase px-1.5">Voice:</span>
+            {(['Aoede', 'Zephyr', 'Kore', 'Puck'] as const).map(v => (
+              <button
+                key={v}
+                onClick={() => setSelectedVoice(v)}
+                disabled={isActive}
+                className={cn(
+                  "px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[11px] sm:text-xs font-semibold transition-all",
+                  selectedVoice === v ? "bg-purple-600/30 text-purple-300 border border-purple-500/40" : "text-zinc-400 hover:text-zinc-200",
+                  isActive ? "opacity-50 cursor-not-allowed" : ""
+                )}
+              >
+                {v}
+              </button>
+            ))}
+          </div>
+
+          {/* Mode Switch */}
+          <div className="bg-zinc-900/80 p-1 rounded-xl border border-zinc-800 flex text-xs">
+            <button
+              onClick={() => setMode('continuous')}
+              className={cn(
+                "px-2.5 py-0.5 sm:px-3 sm:py-1 rounded-lg font-bold uppercase tracking-wider transition-all text-[10px] sm:text-[11px]",
+                mode === 'continuous' ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-500 hover:text-zinc-300"
+              )}
+            >
+              Continuous
+            </button>
+            <button
+              onClick={() => setMode('push')}
+              className={cn(
+                "px-2.5 py-0.5 sm:px-3 sm:py-1 rounded-lg font-bold uppercase tracking-wider transition-all text-[10px] sm:text-[11px]",
+                mode === 'push' ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-500 hover:text-zinc-300"
+              )}
+            >
+              Push-to-Talk
+            </button>
+          </div>
+        </div>
+
+        {/* Live Voice Model & Provider Config (Collapsible on mobile) */}
+        <div className="w-full bg-zinc-900/90 border border-zinc-800/90 rounded-2xl p-2.5 sm:p-3 shadow-lg text-left backdrop-blur-md">
+          <button
+            type="button"
+            onClick={() => setIsConfigExpanded(!isConfigExpanded)}
+            className="w-full flex items-center justify-between pb-1 border-b border-zinc-800/60 text-left cursor-pointer"
+          >
+            <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+              Live Voice Model & Provider Config
+            </span>
+            <div className="flex items-center gap-1.5">
+              {customVoiceModel.trim() ? (
+                <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/40">
+                  Override: {customVoiceModel.trim()}
+                </span>
+              ) : (
+                <span className="text-[9px] font-mono text-zinc-500">
+                  {voiceModel}
+                </span>
+              )}
+              <ChevronDown className={cn("w-3.5 h-3.5 text-zinc-500 transition-transform duration-200", isConfigExpanded ? "rotate-180" : "")} />
+            </div>
+          </button>
+
+          {/* Config fields - expanded on desktop or when toggled */}
+          <div className={cn("space-y-2.5 pt-2", !isConfigExpanded && "hidden sm:block")}>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div>
+                <label className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider block mb-1">
+                  Model Dropdown
+                </label>
+                <Select value={voiceModel} onValueChange={setVoiceModel} disabled={isActive}>
+                  <SelectTrigger className="w-full bg-zinc-950 border-zinc-800 text-zinc-200 text-xs h-9 rounded-xl">
+                    <SelectValue placeholder="Select live voice model" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-zinc-900 border-zinc-800 text-zinc-200 text-xs">
+                    {LIVE_VOICE_MODELS.map((m) => (
+                      <SelectItem key={m.id} value={m.id} className="text-xs">
+                        {m.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div>
+                <label className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider block mb-1">
+                  Custom Model Override
+                </label>
+                <Input
+                  placeholder="Type model name (e.g. gemini-3.8-live)"
+                  value={customVoiceModel}
+                  onChange={(e) => setCustomVoiceModel(e.target.value)}
+                  disabled={isActive}
+                  className="bg-zinc-950 border-zinc-800 text-zinc-200 text-xs h-9 rounded-xl placeholder:text-zinc-600"
+                />
+              </div>
+            </div>
+
+            <div className="pt-1.5 border-t border-zinc-800/60 space-y-1">
+              <div className="flex items-center justify-between text-[10px]">
+                <label className="text-zinc-400 font-semibold flex items-center gap-1">
+                  <Volume2 className="w-3 h-3 text-indigo-400" />
+                  Live Voice WebSocket Endpoint URL:
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setLiveWsEndpoint(DEFAULT_LIVE_WEBSOCKET_URL)}
+                  disabled={isActive}
+                  className="text-[10px] text-purple-400 hover:text-purple-300 underline font-sans disabled:opacity-50"
+                >
+                  Reset to default
+                </button>
+              </div>
+              <Input
+                value={liveWsEndpoint}
+                onChange={(e) => setLiveWsEndpoint(e.target.value)}
+                disabled={isActive}
+                placeholder={DEFAULT_LIVE_WEBSOCKET_URL}
+                className="bg-zinc-950 border-zinc-800 text-zinc-300 font-mono text-[10.5px] h-8 rounded-lg"
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Main Interactive Mic Orb & Session Status Controls (Pinned, always visible and tappable) */}
+        <div className="relative flex flex-col items-center justify-center my-2 sm:my-3 z-20 shrink-0">
+          <AnimatePresence mode="wait">
+            {(isActive && (mode === 'continuous' || isPushing)) && (
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.8 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.8 }}
+                className="absolute inset-0 flex items-center justify-center pointer-events-none"
+              >
+                {[...Array(3)].map((_, i) => (
+                  <motion.div
+                    key={i}
+                    animate={{
+                      scale: isSpeaking ? [1, 1.8, 1] : (userSpeechDetected ? [1, 1.4, 1] : [1, 1.2, 1]),
+                      opacity: isSpeaking ? [0.4, 0, 0.4] : [0.2, 0, 0.2],
+                    }}
+                    transition={{
+                      duration: isSpeaking ? 1.4 : 2.0,
+                      repeat: Infinity,
+                      delay: i * 0.4,
+                    }}
+                    className={cn(
+                      "absolute w-36 h-36 sm:w-44 sm:h-44 rounded-full border",
+                      isSpeaking ? "border-purple-500/50 bg-purple-500/5" : "border-indigo-500/30"
+                    )}
+                  />
+                ))}
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <button
+            onMouseDown={() => mode === 'push' && setIsPushing(true)}
+            onMouseUp={() => mode === 'push' && setIsPushing(false)}
+            onMouseLeave={() => mode === 'push' && setIsPushing(false)}
+            onTouchStart={() => mode === 'push' && setIsPushing(true)}
+            onTouchEnd={() => mode === 'push' && setIsPushing(false)}
+            onClick={handleMicTap}
+            disabled={isConnecting}
+            aria-label={isActive ? (isPaused ? "Resume voice session" : "End voice session") : "Start voice session"}
+            className={cn(
+              "w-28 h-28 sm:w-36 sm:h-36 rounded-full flex flex-col items-center justify-center transition-all duration-500 relative z-20 shadow-2xl focus:outline-none touch-manipulation",
+              isActive 
+                ? (isSpeaking 
+                    ? "bg-purple-950/80 border-2 border-purple-400 text-purple-300 shadow-purple-500/30 scale-105" 
+                    : (userSpeechDetected || isPushing
+                        ? "bg-zinc-900 border-2 border-indigo-400 text-indigo-300 shadow-indigo-500/20" 
+                        : (isPaused
+                            ? "bg-amber-950/40 border-2 border-amber-500/60 text-amber-300 shadow-amber-500/20"
+                            : "bg-zinc-900 border border-zinc-700 text-zinc-300")))
+                : "bg-zinc-900 border border-zinc-800 text-zinc-500 hover:border-purple-500/50 hover:text-purple-400"
+            )}
+          >
+            {isConnecting ? (
+              <Loader2 className="w-10 h-10 sm:w-12 sm:h-12 animate-spin text-purple-400" />
+            ) : isActive ? (
+              <>
+                {isSpeaking ? (
+                  <Volume2 className="w-10 h-10 sm:w-12 sm:h-12 animate-pulse text-purple-400" />
+                ) : isPaused ? (
+                  <MicOff className="w-10 h-10 sm:w-12 sm:h-12 text-amber-400" />
+                ) : (
+                  <Mic className={cn("w-10 h-10 sm:w-12 sm:h-12", userSpeechDetected ? "text-indigo-400 animate-pulse" : "text-zinc-300")} />
+                )}
+                <span className="text-[10px] font-bold uppercase tracking-wider mt-1 text-zinc-400">
+                  {isSpeaking ? "Speaking" : (userSpeechDetected ? "Hearing you" : (isPaused ? "Paused • Tap mic" : "Listening"))}
+                </span>
+              </>
+            ) : (
+              <>
+                <MicOff className="w-10 h-10 sm:w-12 sm:h-12 text-zinc-500" />
+                <span className="text-[10px] font-bold uppercase tracking-wider mt-1 text-zinc-500">Tap to Start</span>
+              </>
+            )}
+          </button>
+
+          {/* Connection Error Notification */}
+          {connectionError && (
+            <div className="mt-2 sm:mt-3 p-2.5 bg-red-950/60 border border-red-800 rounded-xl text-red-300 text-xs flex items-center gap-2 max-w-sm">
+              <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+              <p className="flex-1 text-[11px]">{connectionError}</p>
+              <Button size="sm" variant="ghost" onClick={startSession} className="h-6 px-2 text-[11px] text-red-200 hover:bg-red-900/50">
+                <RefreshCw className="w-3 h-3 mr-1" /> Retry
+              </Button>
+            </div>
+          )}
+
+          {mode === 'push' && !isActive && (
+            <div className="text-center mt-2">
+              <Button 
+                onClick={startSession}
+                variant="outline"
+                className="border-zinc-800 text-zinc-300 hover:bg-zinc-900 rounded-xl px-5 py-2 font-semibold text-xs uppercase tracking-wider"
+              >
+                Start Sierra Voice Channel
+              </Button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Live Transcript Container: Scrolls internally within its own container */}
+      <div className="flex-1 min-h-0 w-full max-w-md relative z-10 flex flex-col my-1 sm:my-2 overflow-hidden">
+        {/* Live Subtitle Transcript Box */}
+        <div className="flex-1 min-h-[140px] bg-zinc-900/70 border border-zinc-800/80 rounded-2xl p-3 sm:p-4 shadow-xl backdrop-blur-md overflow-hidden flex flex-col">
+          <div className="flex items-center justify-between text-[10px] font-bold text-zinc-500 uppercase tracking-widest pb-1 border-b border-zinc-800/50 shrink-0 mb-2">
+            <div className="flex items-center gap-1.5">
+              <MessageSquare className="w-3 h-3 text-purple-400" />
+              <span>Live Dialogue & Transcripts</span>
+            </div>
+            {isActive && (
+              <span className="flex items-center gap-1 text-emerald-400">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                Live Link Active
+              </span>
+            )}
+          </div>
+
+          <div className="flex-1 overflow-y-auto space-y-2 pr-1">
+            {transcripts.length === 0 ? (
+              <p className="text-xs text-zinc-600 text-center py-6 italic">
+                {isActive ? "Speak naturally. Real-time words and Sierra's answers will appear here." : "Start session to begin speaking with Sierra."}
+              </p>
+            ) : (
+              transcripts.map(t => (
+                <div 
+                  key={t.id} 
+                  className={cn(
+                    "text-xs p-2.5 rounded-xl transition-all",
+                    t.sender === 'user' 
+                      ? "bg-zinc-800/60 text-zinc-200 border border-zinc-700/40 ml-4" 
+                      : "bg-purple-950/40 text-purple-200 border border-purple-800/40 mr-4"
+                  )}
+                >
+                  <span className="text-[10px] font-extrabold block uppercase tracking-wider text-zinc-400 mb-0.5">
+                    {t.sender === 'user' ? 'You' : 'Sierra'}
+                  </span>
+                  <p className="leading-relaxed">{t.text}</p>
+                </div>
+              ))
+            )}
+            <div ref={transcriptEndRef} />
+          </div>
+        </div>
+
+        <p className="text-center text-[11px] text-zinc-500 shrink-0 pt-1.5 px-2">
+          {isConnecting ? "Connecting to Sierra neural model..." : 
+           isActive ? (
+             mode === 'push' 
+               ? (isPushing ? "Listening to your voice..." : "Hold the orb to speak, release to hear Sierra.") 
+               : (isSpeaking ? "Sierra is speaking..." : "Listening continuously. Talk whenever you're ready.")
+           ) : "Tap the orb above to begin a natural conversation."}
+        </p>
+      </div>
+
+      {/* On-Demand Diagnostic Pipeline Debug Log Modal / Bottom Sheet (Fix 3) */}
+      {isDebugLogOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/80 backdrop-blur-sm p-0 sm:p-4"
+        >
+          {/* Backdrop click to close */}
+          <div className="absolute inset-0" onClick={() => setIsDebugLogOpen(false)} />
+
+          <div className="relative z-10 bg-zinc-950 border border-amber-500/40 rounded-t-2xl sm:rounded-2xl w-full max-w-lg max-h-[85vh] flex flex-col p-4 shadow-2xl space-y-3 animate-in fade-in slide-in-from-bottom-6 sm:zoom-in-95">
+            {/* Header */}
+            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
+              <div className="flex items-center gap-1.5 text-amber-400">
+                <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                <span className="text-xs font-bold uppercase tracking-wider">Pipeline Stage Debug Output</span>
+                <span className="text-zinc-500 font-mono text-[10px]">({debugLogs.length} events)</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFallbackLogText(formatDebugLogs(debugLogs));
+                    setIsFallbackModalOpen(true);
+                  }}
+                  disabled={debugLogs.length === 0}
+                  className="text-[10px] text-zinc-400 hover:text-zinc-200 underline font-sans flex items-center gap-1 disabled:opacity-30 disabled:no-underline"
+                >
+                  <FileText className="w-3 h-3" />
+                  <span>View Text</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowClearConfirm(true)}
+                  disabled={debugLogs.length === 0}
+                  className="text-[10px] text-zinc-400 hover:text-red-300 underline font-sans disabled:opacity-30 disabled:no-underline"
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsDebugLogOpen(false)}
+                  className="p-1 text-zinc-400 hover:text-white rounded-lg active:bg-zinc-800"
+                  aria-label="Close debug logs"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Log event scroll area */}
+            <div className="font-mono text-[10.5px] leading-relaxed flex-1 min-h-[160px] max-h-64 sm:max-h-80 overflow-y-auto space-y-1 pr-1 bg-black/60 p-2.5 rounded-xl border border-zinc-900">
+              {debugLogs.length === 0 ? (
+                <p className="text-zinc-500 italic py-4 text-center font-sans text-xs">
+                  No pipeline events logged yet. Tap the orb to trigger speech recognition.
+                </p>
+              ) : (
+                debugLogs.map((log) => (
+                  <div key={log.id} className="border-b border-zinc-900/80 pb-0.5">
+                    <span className="text-zinc-500">[{log.time}]</span>{' '}
+                    <span className={cn(
+                      "font-bold",
+                      log.stage.includes('Error') || log.stage.includes('Catch') ? "text-red-400" :
+                      log.stage.includes('partialResults') ? "text-cyan-300" :
+                      log.stage.includes('listeningState') ? "text-yellow-300" :
+                      log.stage.includes('commit') ? "text-emerald-400" :
+                      log.stage.includes('streamChat') ? "text-purple-300" : "text-amber-300"
+                    )}>
+                      [{log.stage}]
+                    </span>{' '}
+                    <span className="text-zinc-300 break-all">{log.detail}</span>
+                  </div>
+                ))
+              )}
+              <div ref={debugScrollRef} />
+            </div>
+
+            {/* Clear confirmation prompt */}
+            {showClearConfirm && (
+              <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 bg-red-950/70 border border-red-500/50 rounded-xl text-xs">
+                <div className="flex items-center gap-1.5 text-red-200 font-medium">
+                  <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                  <span>Clear all {debugLogs.length} events?</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleClearConfirm}
+                    className="min-h-[38px] px-3.5 py-1.5 bg-red-600 hover:bg-red-500 active:bg-red-700 text-white rounded-lg font-semibold text-xs flex items-center justify-center transition-all active:scale-95 shadow-sm"
+                  >
+                    Yes, Clear
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowClearConfirm(false)}
+                    className="min-h-[38px] px-3.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 active:bg-zinc-750 text-zinc-300 rounded-lg text-xs flex items-center justify-center transition-all active:scale-95"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Diagnostic Export and Management Actions */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => copyDebugLogs()}
+                disabled={debugLogs.length === 0}
+                className={cn(
+                  "min-h-[44px] px-3 py-2 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 shadow-sm",
+                  debugLogs.length === 0
+                    ? "bg-zinc-900/50 border border-zinc-800 text-zinc-600 cursor-not-allowed"
+                    : "bg-amber-500/20 hover:bg-amber-500/30 active:bg-amber-500/40 border border-amber-500/50 text-amber-300"
+                )}
+                title="Copy all debug events to clipboard"
+              >
+                {isCopied ? (
+                  <>
+                    <Check className="w-4 h-4 shrink-0 text-emerald-400" />
+                    <span className="text-emerald-300">Copied!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-4 h-4 shrink-0 text-amber-400" />
+                    <span>Copy All</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => copyDebugLogs(20)}
+                disabled={debugLogs.length === 0}
+                className={cn(
+                  "min-h-[44px] px-3 py-2 rounded-xl font-medium text-xs flex items-center justify-center gap-2 transition-all active:scale-95",
+                  debugLogs.length === 0
+                    ? "bg-zinc-900/50 border border-zinc-800 text-zinc-600 cursor-not-allowed"
+                    : "bg-zinc-900 hover:bg-zinc-800 active:bg-zinc-750 border border-zinc-700/60 text-zinc-200"
+                )}
+                title="Copy the most recent 20 lines to clipboard"
+              >
+                <FileText className="w-4 h-4 shrink-0 text-zinc-400" />
+                <span>Copy Last 20 Lines</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowClearConfirm(true)}
+                disabled={debugLogs.length === 0}
+                className={cn(
+                  "min-h-[44px] px-3 py-2 rounded-xl font-medium text-xs flex items-center justify-center gap-2 transition-all active:scale-95",
+                  debugLogs.length === 0
+                    ? "bg-zinc-900/50 border border-zinc-800 text-zinc-600 cursor-not-allowed"
+                    : "bg-zinc-900 hover:bg-red-950/40 active:bg-red-950/60 border border-zinc-800 hover:border-red-500/40 text-zinc-400 hover:text-red-300"
+                )}
+                title="Clear all recorded events"
+              >
+                <Trash2 className="w-4 h-4 shrink-0" />
+                <span>Clear Debug Log</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Selectable-Text Fallback Modal Dialog */}
+      {isFallbackModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-4"
+        >
+          <div className="bg-zinc-900 border border-zinc-700/80 rounded-2xl w-full max-w-lg p-4 shadow-2xl flex flex-col max-h-[85vh] space-y-3 animate-in fade-in zoom-in-95">
+            <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
+              <div>
+                <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                  <Copy className="w-4 h-4 text-amber-400" />
+                  Diagnostic Debug Log
+                </h3>
+                <p className="text-[11px] text-zinc-400">
+                  Select all and copy to paste into ChatGPT:
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsFallbackModalOpen(false)}
+                className="min-h-[48px] min-w-[48px] p-2 flex items-center justify-center text-zinc-400 hover:text-white rounded-lg active:bg-zinc-800"
+                aria-label="Close dialog"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <textarea
+              ref={fallbackTextareaRef}
+              readOnly
+              value={fallbackLogText}
+              onClick={(e) => (e.target as HTMLTextAreaElement).select()}
+              className="flex-1 w-full min-h-[220px] font-mono text-[11px] leading-relaxed bg-black/90 text-zinc-200 p-3 rounded-xl border border-zinc-800 focus:outline-none focus:ring-1 focus:ring-amber-500 select-all resize-none"
+            />
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => {
+                  if (fallbackTextareaRef.current) {
+                    fallbackTextareaRef.current.focus();
+                    fallbackTextareaRef.current.select();
+                    try {
+                      document.execCommand('copy');
+                      toast.success("Debug log copied. Paste it into ChatGPT.");
+                    } catch (_) {
+                      toast.info("Text selected! Use your device's copy option.");
+                    }
+                  }
+                }}
+                className="min-h-[48px] px-4 py-2 bg-amber-500 hover:bg-amber-400 active:bg-amber-600 text-black font-semibold text-xs rounded-xl flex items-center gap-2 active:scale-95 transition-all shadow-sm"
+              >
+                <Copy className="w-4 h-4" />
+                Select & Copy All
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsFallbackModalOpen(false)}
+                className="min-h-[48px] px-4 py-2 bg-zinc-800 hover:bg-zinc-700 active:bg-zinc-750 text-zinc-200 text-xs font-medium rounded-xl active:scale-95 transition-all"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
