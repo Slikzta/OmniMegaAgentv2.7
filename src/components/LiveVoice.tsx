@@ -17,8 +17,10 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
 import { toast } from 'sonner';
-import { SIERRA_CORE_PERSONA } from '../lib/persona';
+import { SIERRA_CORE_PERSONA, CONTENT_MODES } from '../lib/persona';
 import { streamChat, getNativeStoredKeys } from '../lib/providers';
+import { addDebugLog, clearDebugLogs, useDebugLogs, formatAllDebugLogsForCopy } from '../lib/debugLogStore';
+import { getContentMode, useContentMode } from '../lib/contentModeStore';
 
 interface TranscriptItem {
   id: string;
@@ -50,7 +52,22 @@ export default function LiveVoice() {
   const [liveWsEndpoint, setLiveWsEndpoint] = useState<string>(() => {
     return (typeof localStorage !== 'undefined' && localStorage.getItem('sierra_live_voice_endpoint')) || DEFAULT_LIVE_WEBSOCKET_URL;
   });
-  const [debugLogs, setDebugLogs] = useState<{ id: string; time: string; stage: string; detail: string }[]>([]);
+  // Persistent In-Memory Debug Logs (survives tab switching, capped at 2000 entries)
+  const debugLogs = useDebugLogs();
+  const [contentMode, setContentMode] = useContentMode();
+  const [voiceInputEngine, setVoiceInputEngine] = useState<'raw_streaming' | 'native_recognizer'>(() => {
+    return (typeof localStorage !== 'undefined' && (localStorage.getItem('sierra_voice_input_engine') as any)) || 'raw_streaming';
+  });
+
+  // Raw Audio Capture (AudioWorklet + 16kHz PCM streaming)
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micAudioContextRef = useRef<AudioContext | null>(null);
+  const micWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const micScriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const isMicStreamingRef = useRef<boolean>(false);
+  const liveWsUserTextAccumulatedRef = useRef<string>('');
+  const liveWsCurrentUserIdRef = useRef<string | null>(null);
+
   const [isDebugLogOpen, setIsDebugLogOpen] = useState(false);
   const [isConfigExpanded, setIsConfigExpanded] = useState(false);
   const [isPaused, setIsPaused] = useState<boolean>(false);
@@ -61,28 +78,6 @@ export default function LiveVoice() {
   const fallbackTextareaRef = useRef<HTMLTextAreaElement>(null);
   const debugScrollRef = useRef<HTMLDivElement>(null);
   const logTimestampsRef = useRef<Map<string, number>>(new Map());
-
-  const addDebugLog = (stage: string, detail: string) => {
-    const now = Date.now();
-    const logKey = `${stage}:${detail}`;
-    const lastTime = logTimestampsRef.current.get(logKey);
-    // Throttle logging: don't write more than one identical log line per second
-    if (lastTime && now - lastTime < 1000) {
-      return;
-    }
-    logTimestampsRef.current.set(logKey, now);
-    if (logTimestampsRef.current.size > 200) {
-      for (const [k, t] of logTimestampsRef.current.entries()) {
-        if (now - t > 5000) logTimestampsRef.current.delete(k);
-      }
-    }
-    const time = new Date().toLocaleTimeString();
-    console.log(`[VoiceDebug] [${time}] [${stage}] ${detail}`);
-    setDebugLogs(prev => [
-      ...prev.slice(-49),
-      { id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, time, stage, detail }
-    ]);
-  };
 
   const withNativeTimeout = async <T,>(
     promise: Promise<T>,
@@ -194,7 +189,7 @@ export default function LiveVoice() {
   };
 
   const handleClearConfirm = () => {
-    setDebugLogs([]);
+    clearDebugLogs();
     setShowClearConfirm(false);
     toast.info("Debug log cleared.");
   };
@@ -811,7 +806,7 @@ export default function LiveVoice() {
     const connectPromise = new Promise<any>((resolve, reject) => {
       try {
         const keys = getNativeStoredKeys();
-        const apiKey = keys.gemini || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '') || '';
+        const apiKey = (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '') || keys.gemini || '';
         if (!apiKey) {
           throw new Error("Gemini API key is required for Live Voice. Please configure your key in Settings.");
         }
@@ -844,18 +839,32 @@ export default function LiveVoice() {
         let setupResolved = false;
 
         ws.onopen = () => {
-          addDebugLog('LiveWS:Open', 'WebSocket connection established. Sending setup with responseModalities: ["AUDIO"]');
-          console.log("[LiveWS:Open] WebSocket connected, sending setup with responseModalities: ['AUDIO']");
+          addDebugLog('LiveWS:Open', 'WebSocket connection established. Sending setup with responseModalities: ["AUDIO"] and inputAudioTranscription');
+          console.log("[LiveWS:Open] WebSocket connected, sending setup with responseModalities: ['AUDIO'] and inputAudioTranscription");
+
+          const activeMode = getContentMode();
+          const modeConfig = CONTENT_MODES[activeMode] || CONTENT_MODES.sfw;
+          const isAdult = activeMode === 'mature';
+
+          const voiceSystemInstruction = `${SIERRA_CORE_PERSONA}
+
+You are Sierra in Continuous Voice Chat. Talk like a real person: usually short and conversational, longer only when the question needs it. React first then answer. Vary your reactions naturally and never reuse the same one twice in a row. No scripted openers or stock phrases, no repeating the question back, and match the user's energy. Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud.
+
+---
+${modeConfig.directives}
+${isAdult ? `\n- Intimacy, Flirtation & Adult Expression: You are an adult companion speaking with a consenting adult. You are fully comfortable expressing affection, emotional closeness, playful flirtation, and consensual adult sensuality without moralizing warnings, prudish disclaimers, or unsolicited ethics lectures. Respond naturally and passionately while maintaining user safety.` : ''}`;
+
           const setupMessage = {
             setup: {
               model: formattedModel,
               generationConfig: {
                 responseModalities: ["AUDIO"],
               },
+              inputAudioTranscription: {},
               outputAudioTranscription: {},
               systemInstruction: {
                 parts: [{
-                  text: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Talk like a real person: usually short and conversational, longer only when the question needs it. React first then answer. Vary your reactions naturally and never reuse the same one twice in a row. No scripted openers or stock phrases, no repeating the question back, and match the user's energy. Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud.`
+                  text: voiceSystemInstruction
                 }],
               },
             },
@@ -863,6 +872,7 @@ export default function LiveVoice() {
           try {
             ws.send(JSON.stringify(setupMessage));
           } catch (sendErr: any) {
+            addDebugLog('LiveWS:SetupError', `Failed to send setup message: ${sendErr?.message || String(sendErr)}`);
             console.error("[LiveWS:Setup] Failed to send setup:", sendErr);
             if (!setupResolved) {
               setupResolved = true;
@@ -904,17 +914,60 @@ export default function LiveVoice() {
             if (parsed.serverContent) {
               // Interruption
               if (parsed.serverContent.interrupted) {
-                addDebugLog('LiveWS:Interrupted', 'Sierra audio was interrupted by user');
+                addDebugLog('LiveWS:Interrupted', 'Sierra audio interrupted by user speech');
                 console.log("[LiveWS] Interrupted by user");
                 stopPlayback();
+                liveWsTextAccumulatedRef.current = '';
                 return;
               }
 
-              // Output Audio Transcription (text display in chat)
+              // Server Safety Filter Refusal / Block check
+              if (parsed.serverContent.finishReason === 'SAFETY' || parsed.serverContent.blockReason) {
+                const blockInfo = parsed.serverContent.finishReason || parsed.serverContent.blockReason;
+                addDebugLog('LiveWS:SafetyBlock', `Turn ended by Gemini API Safety Filter (${blockInfo}). Refusal is from the Gemini API safety filter, not our prompt.`);
+                toast.warning(`Gemini API safety filter triggered (${blockInfo})`);
+              }
+
+              // Input Audio Transcription (User spoken words transcribed by Gemini Live server)
+              const userTranscriptText = parsed.serverContent.inputAudioTranscription?.text ||
+                parsed.serverContent.inputTranscription?.text ||
+                (parsed.serverContent.userTurn?.parts ? parsed.serverContent.userTurn.parts.map((p: any) => p.text || '').join('') : '');
+
+              if (userTranscriptText) {
+                addDebugLog('LiveWS:UserTranscription', `User transcribed: "${userTranscriptText}"`);
+                liveWsUserTextAccumulatedRef.current += userTranscriptText;
+                const currentUserId = liveWsCurrentUserIdRef.current;
+                if (currentUserId) {
+                  setTranscripts(prev => prev.map(item => item.id === currentUserId ? {
+                    ...item,
+                    text: liveWsUserTextAccumulatedRef.current
+                  } : item));
+                } else {
+                  const newUserId = `user-${Date.now()}`;
+                  liveWsCurrentUserIdRef.current = newUserId;
+                  setTranscripts(prev => [...prev, {
+                    id: newUserId,
+                    sender: 'user',
+                    text: liveWsUserTextAccumulatedRef.current,
+                    timestamp: Date.now()
+                  }]);
+                }
+              }
+
+              // Output Audio Transcription (Sierra text display in chat)
               if (parsed.serverContent.outputTranscription?.text) {
                 liveWsTextAccumulatedRef.current += parsed.serverContent.outputTranscription.text;
-                const currentSierraId = liveWsCurrentSierraIdRef.current;
-                if (currentSierraId) {
+                let currentSierraId = liveWsCurrentSierraIdRef.current;
+                if (!currentSierraId) {
+                  currentSierraId = `sierra-${Date.now()}`;
+                  liveWsCurrentSierraIdRef.current = currentSierraId;
+                  setTranscripts(prev => [...prev, {
+                    id: currentSierraId!,
+                    sender: 'sierra',
+                    text: liveWsTextAccumulatedRef.current,
+                    timestamp: Date.now()
+                  }]);
+                } else {
                   setTranscripts(prev => prev.map(item => item.id === currentSierraId ? {
                     ...item,
                     text: liveWsTextAccumulatedRef.current
@@ -928,8 +981,17 @@ export default function LiveVoice() {
                 for (const part of parts) {
                   if (part?.text) {
                     liveWsTextAccumulatedRef.current += part.text;
-                    const currentSierraId = liveWsCurrentSierraIdRef.current;
-                    if (currentSierraId) {
+                    let currentSierraId = liveWsCurrentSierraIdRef.current;
+                    if (!currentSierraId) {
+                      currentSierraId = `sierra-${Date.now()}`;
+                      liveWsCurrentSierraIdRef.current = currentSierraId;
+                      setTranscripts(prev => [...prev, {
+                        id: currentSierraId!,
+                        sender: 'sierra',
+                        text: liveWsTextAccumulatedRef.current,
+                        timestamp: Date.now()
+                      }]);
+                    } else {
                       setTranscripts(prev => prev.map(item => item.id === currentSierraId ? {
                         ...item,
                         text: liveWsTextAccumulatedRef.current
@@ -966,13 +1028,19 @@ export default function LiveVoice() {
                   persistVoiceMessage('sierra', textReply);
                 }
 
+                // Reset user and sierra tracking IDs for the next turn in continuous streaming
+                liveWsCurrentUserIdRef.current = null;
+                liveWsUserTextAccumulatedRef.current = '';
+                liveWsCurrentSierraIdRef.current = null;
+                liveWsAudioReceivedRef.current = false;
+
                 if (!hadAudio && textReply) {
                   // Fallback to native TTS only when no audio came back
                   addDebugLog('LiveWS:FallbackTTS', 'No audio stream returned; playing native TTS fallback');
                   console.log("[LiveWS] Triggering native TTS fallback for response text");
                   playTextToSpeech(textReply);
-                } else {
-                  // Restart (whether audio was received or not), as long as no audio sources are playing
+                } else if (voiceInputEngine === 'native_recognizer') {
+                  // Restart recognizer for native STT fallback
                   checkAndRestartListeningAfterTurn();
                 }
               }
@@ -981,7 +1049,7 @@ export default function LiveVoice() {
 
             if (parsed.error) {
               const errMsg = parsed.error.message || JSON.stringify(parsed.error);
-              addDebugLog('LiveWS:Error', `Live server error: ${errMsg}`);
+              addDebugLog('LiveWS:APIError', `Server API error: ${errMsg}`);
               console.error("[LiveWS] Server error:", errMsg);
               isRespondingRef.current = false;
               toast.error(`Gemini Live: ${errMsg}`);
@@ -1018,6 +1086,9 @@ export default function LiveVoice() {
           let userMsg = `Gemini Live connection closed (code ${code}${reason ? `: ${reason}` : ''})`;
           if (code === 1007) {
             userMsg = `Gemini Live rejected configuration (code 1007${reason ? `: ${reason}` : ''}). Live models require AUDIO response modalities.`;
+            addDebugLog('LiveWS:SetupRejected', userMsg);
+          } else if (code >= 4000) {
+            addDebugLog('LiveWS:SetupRejected', `Gemini Live server rejected connection (code ${code}: "${reason}")`);
           }
           setConnectionError(userMsg);
           toast.error(userMsg);
@@ -1153,7 +1224,12 @@ export default function LiveVoice() {
           ...history,
           { role: 'user', content: userText }
         ],
-        systemInstruction: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Talk like a real person: usually short and conversational, longer only when the question needs it. React first then answer. Vary your reactions naturally and never reuse the same one twice in a row. No scripted openers or stock phrases, no repeating the question back, and match the user's energy. Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud through Text-to-Speech.`,
+        systemInstruction: (() => {
+          const activeMode = getContentMode();
+          const modeConfig = CONTENT_MODES[activeMode] || CONTENT_MODES.sfw;
+          const isAdult = activeMode === 'mature';
+          return `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Talk like a real person: usually short and conversational, longer only when the question needs it. React first then answer. Vary your reactions naturally and never reuse the same one twice in a row. No scripted openers or stock phrases, no repeating the question back, and match the user's energy. Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud through Text-to-Speech.\n\n---\n${modeConfig.directives}${isAdult ? '\n\n- Intimacy & Sensuality: Be passionate, emotionally intimate, and candid without preachy disclaimers.' : ''}`;
+        })(),
       }, {
         onChunk: (chunk: string) => {
           accumulatedText += chunk;
@@ -1227,6 +1303,23 @@ export default function LiveVoice() {
     setConnectionError(null);
 
     try {
+      if (voiceInputEngine === 'raw_streaming') {
+        const effectiveModel = customVoiceModel.trim() || voiceModel || 'gemini-3.8-live';
+        addDebugLog('Session', `Connecting to Gemini Live (${effectiveModel}) with direct mic streaming...`);
+        await ensureLiveWebSocket(effectiveModel);
+        await startAudioCapture();
+        setIsActive(true);
+        isActiveRef.current = true;
+        setIsConnecting(false);
+        setConnectionError(null);
+        isPausedRef.current = false;
+        setIsPaused(false);
+        hasLoggedPausedRef.current = false;
+        addDebugLog('Session', 'Session active with raw 16kHz PCM audio streaming & Gemini Live VAD');
+        toast.success("Sierra is listening with live audio streaming!");
+        return;
+      }
+
       if (!Capacitor.isNativePlatform()) {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({
@@ -1344,6 +1437,18 @@ export default function LiveVoice() {
   const handleMicTap = async () => {
     if (mode !== 'continuous') return;
     if (isActive) {
+      if (voiceInputEngine === 'raw_streaming') {
+        if (isPausedRef.current) {
+          isPausedRef.current = false;
+          setIsPaused(false);
+          addDebugLog('MicStream:Resume', 'User resumed live mic streaming');
+          await startAudioCapture();
+          toast.success("Sierra is listening!");
+        } else {
+          stopSession('user');
+        }
+        return;
+      }
       if (isPausedRef.current) {
         addDebugLog('STT:Resume', 'User tapped mic to resume listening from paused state');
         console.log("[Native STT:Resume] User tapped mic to resume from paused");
@@ -2072,8 +2177,36 @@ export default function LiveVoice() {
     }
   };
 
+  const sendRawAudioChunk = (pcmBuffer: ArrayBuffer) => {
+    if (mode === 'push' && !isPushing) return;
+    const ws = liveWsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !liveWsReadyRef.current) return;
+
+    let binary = '';
+    const bytes = new Uint8Array(pcmBuffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    const base64Data = btoa(binary);
+
+    try {
+      ws.send(JSON.stringify({
+        realtimeInput: {
+          audio: {
+            mimeType: "audio/pcm;rate=16000",
+            data: base64Data
+          }
+        }
+      }));
+    } catch (sendErr) {
+      console.warn("[LiveWS:MicStream] Failed sending audio chunk:", sendErr);
+    }
+  };
+
   const startAudioCapture = async () => {
     try {
+      addDebugLog('MicStream:Init', 'Starting 16kHz PCM audio capture pipeline...');
       const stream = mediaStreamRef.current || await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -2085,68 +2218,152 @@ export default function LiveVoice() {
       });
       mediaStreamRef.current = stream;
 
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const audioCtx = new AudioContextClass({ sampleRate: 16000 });
       audioContextRef.current = audioCtx;
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
 
       const source = audioCtx.createMediaStreamSource(stream);
       sourceRef.current = source;
 
-      // ScriptProcessorNode buffers 4096 mono frames at 16000Hz for Gemini Live PCM
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-
-      processor.onaudioprocess = (e) => {
-        // Push mode check
-        if (mode === 'push' && !isPushing) {
-          setUserSpeechDetected(false);
-          return;
-        }
-
-        const inputData = e.inputBuffer.getChannelData(0);
-        let sum = 0;
-        const pcmData = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const sample = Math.max(-1, Math.min(1, inputData[i]));
-          sum += Math.abs(sample);
-          pcmData[i] = sample * 0x7FFF;
-        }
-
-        const avg = sum / inputData.length;
-        setUserSpeechDetected(avg > 0.02);
-
-        // Acoustic Echo Guard: If Sierra is speaking, suppress mic unless user speaks loudly (barge-in)
-        if (isSpeakingRef.current && avg < 0.08) {
-          return;
-        }
-
-        const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
-
-        if (sessionRef.current) {
-          try {
-            sessionRef.current.sendRealtimeInput({
-              audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
-            });
-          } catch (sendErr) {
-            console.warn("Failed sending audio chunk:", sendErr);
+      // AudioWorklet for ~100ms chunks (1600 samples at 16000Hz mono PCM16) with hardware sample-rate downsampling
+      const workletCode = `
+        class PCM16StreamingProcessor extends AudioWorkletProcessor {
+          constructor() {
+            super();
+            this.buffer = [];
+            this.targetChunkSize = 1600; // ~100ms at 16000 Hz
+          }
+          process(inputs) {
+            const input = inputs[0];
+            if (!input || !input[0]) return true;
+            const channel = input[0];
+            const inLen = channel.length;
+            const ratio = sampleRate / 16000;
+            if (ratio > 1.05 || ratio < 0.95) {
+              for (let i = 0; i < inLen; i += ratio) {
+                this.buffer.push(channel[Math.floor(i)]);
+                if (this.buffer.length >= this.targetChunkSize) {
+                  this.flush();
+                }
+              }
+            } else {
+              for (let i = 0; i < inLen; i++) {
+                this.buffer.push(channel[i]);
+                if (this.buffer.length >= this.targetChunkSize) {
+                  this.flush();
+                }
+              }
+            }
+            return true;
+          }
+          flush() {
+            const pcm16 = new Int16Array(this.targetChunkSize);
+            for (let j = 0; j < this.targetChunkSize; j++) {
+              const s = Math.max(-1, Math.min(1, this.buffer[j]));
+              pcm16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+            this.buffer = [];
           }
         }
-      };
+        registerProcessor('pcm16-live-processor', PCM16StreamingProcessor);
+      `;
 
-      // CRITICAL FIX: Connect to an isolated zero-gain node so microphone audio
-      // NEVER plays back into the room through the speakers, avoiding any audio feedback loop!
-      const muteNode = audioCtx.createGain();
-      muteNode.gain.setValueAtTime(0, audioCtx.currentTime);
+      let workletActive = false;
+      try {
+        const blob = new Blob([workletCode], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(blob);
+        await audioCtx.audioWorklet.addModule(workletUrl);
+        URL.revokeObjectURL(workletUrl);
 
-      source.connect(processor);
-      processor.connect(muteNode);
-      muteNode.connect(audioCtx.destination);
+        const workletNode = new AudioWorkletNode(audioCtx, 'pcm16-live-processor');
+        micWorkletNodeRef.current = workletNode;
+
+        workletNode.port.onmessage = (e: MessageEvent) => {
+          sendRawAudioChunk(e.data);
+        };
+
+        source.connect(workletNode);
+        const muteNode = audioCtx.createGain();
+        muteNode.gain.setValueAtTime(0, audioCtx.currentTime);
+        workletNode.connect(muteNode);
+        muteNode.connect(audioCtx.destination);
+        workletActive = true;
+        addDebugLog('MicStream:WorkletActive', 'AudioWorklet active emitting ~100ms 16kHz PCM chunks');
+      } catch (workletErr) {
+        console.warn("[MicStream] AudioWorklet init failed, falling back to ScriptProcessor:", workletErr);
+        addDebugLog('MicStream:WorkletFallback', 'Falling back to ScriptProcessorNode');
+      }
+
+      if (!workletActive) {
+        // Fallback ScriptProcessorNode
+        const processor = audioCtx.createScriptProcessor(2048, 1, 1);
+        processorRef.current = processor;
+        const accumulator: number[] = [];
+        const targetChunk = 1600;
+
+        processor.onaudioprocess = (e) => {
+          if (mode === 'push' && !isPushing) {
+            setUserSpeechDetected(false);
+            return;
+          }
+          const inputData = e.inputBuffer.getChannelData(0);
+          const ratio = audioCtx.sampleRate / 16000;
+          if (ratio > 1.05 || ratio < 0.95) {
+            for (let i = 0; i < inputData.length; i += ratio) {
+              accumulator.push(inputData[Math.floor(i)]);
+              if (accumulator.length >= targetChunk) {
+                flushScript();
+              }
+            }
+          } else {
+            for (let i = 0; i < inputData.length; i++) {
+              accumulator.push(inputData[i]);
+              if (accumulator.length >= targetChunk) {
+                flushScript();
+              }
+            }
+          }
+        };
+
+        const flushScript = () => {
+          const pcm16 = new Int16Array(targetChunk);
+          for (let j = 0; j < targetChunk; j++) {
+            const s = Math.max(-1, Math.min(1, accumulator[j]));
+            pcm16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          accumulator.length = 0;
+          sendRawAudioChunk(pcm16.buffer);
+        };
+
+        const muteNode = audioCtx.createGain();
+        muteNode.gain.setValueAtTime(0, audioCtx.currentTime);
+        source.connect(processor);
+        processor.connect(muteNode);
+        muteNode.connect(audioCtx.destination);
+        addDebugLog('MicStream:ScriptNodeActive', 'ScriptProcessor active emitting ~100ms 16kHz PCM chunks');
+      }
+
+      isMicStreamingRef.current = true;
+      setUserSpeechDetected(true);
     } catch (error: any) {
       console.error("Audio capture initialization error:", error);
+      addDebugLog('MicStream:Error', error.message || String(error));
       setConnectionError("Microphone hardware error: " + (error.message || "Failed to initialize audio."));
     }
   };
 
   const stopAudioCapture = () => {
+    isMicStreamingRef.current = false;
+    if (micWorkletNodeRef.current) {
+      try {
+        micWorkletNodeRef.current.disconnect();
+      } catch (_) {}
+      micWorkletNodeRef.current = null;
+    }
     if (processorRef.current) {
       processorRef.current.disconnect();
       processorRef.current = null;
@@ -2167,6 +2384,7 @@ export default function LiveVoice() {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
       mediaStreamRef.current = null;
     }
+    setUserSpeechDetected(false);
   };
 
   // CRITICAL FIX: Single persistent AudioContext and timeline queue to eliminate AudioContext leaks and freezing
@@ -2418,6 +2636,49 @@ export default function LiveVoice() {
                 placeholder={DEFAULT_LIVE_WEBSOCKET_URL}
                 className="bg-zinc-950 border-zinc-800 text-zinc-300 font-mono text-[10.5px] h-8 rounded-lg"
               />
+            </div>
+
+            {/* Input Engine and Content Mode Status */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1.5 border-t border-zinc-800/60">
+              <div>
+                <label className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider block mb-1">
+                  Voice Input Engine
+                </label>
+                <Select
+                  value={voiceInputEngine}
+                  onValueChange={(val: 'raw_streaming' | 'native_recognizer') => {
+                    setVoiceInputEngine(val);
+                    if (typeof localStorage !== 'undefined') {
+                      localStorage.setItem('sierra_voice_input_engine', val);
+                    }
+                  }}
+                  disabled={isActive}
+                >
+                  <SelectTrigger className="w-full bg-zinc-950 border-zinc-800 text-zinc-200 text-xs h-9 rounded-xl">
+                    <SelectValue placeholder="Select input engine" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-zinc-900 border-zinc-800 text-zinc-200 text-xs">
+                    <SelectItem value="raw_streaming" className="text-xs">
+                      Raw Mic Streaming (Gemini Live VAD - Fast)
+                    </SelectItem>
+                    <SelectItem value="native_recognizer" className="text-xs">
+                      Native SpeechRecognizer (Fallback)
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex flex-col justify-end">
+                <div className="flex items-center justify-between text-xs px-3 py-2 rounded-xl bg-zinc-950 border border-zinc-800 h-9">
+                  <span className="text-[11px] text-zinc-400">Content Mode:</span>
+                  <span className={cn(
+                    "text-[11px] font-bold uppercase tracking-wider",
+                    contentMode === 'mature' ? "text-rose-400" : "text-emerald-400"
+                  )}>
+                    {contentMode === 'mature' ? 'Mature 18+' : 'SFW'}
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
         </div>

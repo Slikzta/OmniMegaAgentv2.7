@@ -50,6 +50,7 @@ import {
   buildSierraSystemInstruction,
   ContentMode
 } from '../lib/gemini';
+import { useContentMode } from '../lib/contentModeStore';
 
 const PERSONAS = [
   {
@@ -396,10 +397,8 @@ export default function ChatInterface({ onOpenSettings }: { onOpenSettings?: () 
   const [selectedModelId, setSelectedModelId] = useState<string>(MODELS.CHAT_FLASH);
   const [sessions, setSessions] = useState<{ id: string; title: string; timestamp: any }[]>([]);
 
-  // Sierra Content Mode State (SFW vs. Mature / Adult 18+)
-  const [contentMode, setContentMode] = useState<ContentMode>(() => {
-    return (typeof localStorage !== 'undefined' && (localStorage.getItem('sierra_content_mode') as ContentMode)) || 'sfw';
-  });
+  // Sierra Content Mode State (Shared Store: SFW vs. Mature / Adult 18+, persisted under 'sierra_content_mode')
+  const [contentMode, setContentMode] = useContentMode();
 
   const handleContentModeChange = (mode: ContentMode) => {
     setContentMode(mode);

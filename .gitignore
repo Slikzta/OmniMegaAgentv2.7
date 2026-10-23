@@ -4,8 +4,17 @@ dist/
 coverage/
 .DS_Store
 *.log
-.env*
+
+# Environment and sensitive keys
+.env
+.env.local
+.env.*
 !.env.example
+*.key
+*secret*
+*credentials*
+service-account*.json
+
 .tools/
 .gradle/
 android/.gradle/
@@ -17,4 +26,3 @@ android/build/
 *.jks
 !**/debug.keystore
 !**/debug.keystore.base64
-

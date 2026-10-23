@@ -37,6 +37,7 @@ import { toast } from 'sonner';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { CONTENT_MODES, ContentMode, SIERRA_CORE_PERSONA, SIERRA_PERSONAS } from '../lib/persona';
+import { useContentMode } from '../lib/contentModeStore';
 import { PROVIDER_CONTENT_CAPABILITIES } from '../lib/providers';
 
 import { DEFAULT_LIVE_WEBSOCKET_URL } from '../lib/gemini';
@@ -130,10 +131,8 @@ export default function SettingsView({ onNavigateToChat }: SettingsProps) {
   const [activeTab, setActiveTab] = useState<'providers' | 'voice' | 'sierra' | 'mobile'>('providers');
   const [isLoading, setIsLoading] = useState(true);
 
-  // Sierra Content Mode & Directives State
-  const [contentMode, setContentMode] = useState<ContentMode>(() => {
-    return (typeof localStorage !== 'undefined' && (localStorage.getItem('sierra_content_mode') as ContentMode)) || 'sfw';
-  });
+  // Sierra Content Mode & Directives State (Shared Store)
+  const [contentMode, setContentMode] = useContentMode();
   const [customDirectives, setCustomDirectives] = useState<string>(() => {
     return (typeof localStorage !== 'undefined' && localStorage.getItem('sierra_custom_directives')) || '';
   });

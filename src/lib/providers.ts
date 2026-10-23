@@ -486,7 +486,7 @@ export async function streamChat(
   // (bidiGenerateContent) pipeline that the Test Connection feature already uses.
   if (isGeminiLiveModel(requestedModel)) {
     const keys = getNativeStoredKeys();
-    const effectiveKey = keys[params.provider || 'gemini'] || keys.gemini || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '');
+    const effectiveKey = (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '') || keys[params.provider || 'gemini'] || keys.gemini || '';
     const customWsUrl = typeof localStorage !== 'undefined' ? localStorage.getItem('sierra_live_voice_endpoint') || undefined : undefined;
 
     if (effectiveKey) {

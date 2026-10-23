@@ -1,10 +1,13 @@
 import { GoogleGenAI, Modality, Type } from "@google/genai";
 
-const apiKey = process.env.GEMINI_API_KEY;
+export const getGeminiApiKey = (): string => {
+  return (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '') || '';
+};
 
 export const getGeminiAI = () => {
-  if (!apiKey) throw new Error("GEMINI_API_KEY is missing");
-  return new GoogleGenAI({ apiKey });
+  const key = getGeminiApiKey();
+  if (!key) throw new Error("GEMINI_API_KEY is missing");
+  return new GoogleGenAI({ apiKey: key });
 };
 
 export const MODELS = {
